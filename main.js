@@ -1,6 +1,7 @@
 'use strict';
 
 const fs = require('node:fs');
+const readline = require('node:readline');
 const { WebSocketServer } = require('ws');
 
 const settings = require('./settings.json');
@@ -10,19 +11,28 @@ const EMPTY_BUFFER = Buffer.alloc(0);
 const EMPTY_STRING = Buffer.from([0]);
 const writer = Buffer.alloc(2 ** 22); // 4MB is more than enough, even for the most extreme cases
 
+const encodeUtf8 = s => {
+	const base = Buffer.from(s);
+	const out = Buffer.alloc(base.byteLength + 1); // null-terminated
+	for (let o = 0; o < base.byteLength; ++o) {
+		out[o] = base[o] || 0xff; // get rid of null terminators
+	}
+	return out;
+};
+
 //========== bitgrid ===================================================================================================
 
 // undefined behaviour occurs if a cell ever exists beyond the bitgrid, just keep it in mind
 // (the width and height) get all messed up
-const BITGRID_TILE_SIZE = Math.max(1250, (settings.mapWidth * 2 + 3000) / 32);
+const BITGRID_TILE_SIZE = Math.max(1250, (settings.worldMapW * 2 + 3000) / 32);
 const bitgridTiles = [];
 for (let i = 0; i < 1024; ++i) bitgridTiles.push(new Set());
 
 const bitgridAdd = cell => {
-	const xmin = ~~((cell.x + settings.mapWidth - cell.r) / BITGRID_TILE_SIZE);
-	const xmax = ~~((cell.x + settings.mapWidth + cell.r) / BITGRID_TILE_SIZE);
-	const ymin = ~~((cell.y + settings.mapHeight - cell.r) / BITGRID_TILE_SIZE);
-	const ymax = ~~((cell.y + settings.mapHeight + cell.r) / BITGRID_TILE_SIZE);
+	const xmin = ((cell.x + settings.worldMapW - cell.r) / BITGRID_TILE_SIZE) & 0x1f;
+	const xmax = ((cell.x + settings.worldMapW + cell.r) / BITGRID_TILE_SIZE) & 0x1f;
+	const ymin = ((cell.y + settings.worldMapH - cell.r) / BITGRID_TILE_SIZE) & 0x1f;
+	const ymax = ((cell.y + settings.worldMapH + cell.r) / BITGRID_TILE_SIZE) & 0x1f;
 	cell.bgXmin = xmin; cell.bgXmax = xmax; cell.bgYmin = ymin; cell.bgYmax = ymax;
 
 	for (let x = xmin; x <= xmax; ++x) {
@@ -34,10 +44,10 @@ const bitgridAdd = cell => {
 
 const bitgridUpdate = cell => {
 	const { bgXmin, bgXmax, bgYmin, bgYmax } = cell;
-	const xmin = ~~((cell.x + settings.mapWidth - cell.r) / BITGRID_TILE_SIZE);
-	const xmax = ~~((cell.x + settings.mapWidth + cell.r) / BITGRID_TILE_SIZE);
-	const ymin = ~~((cell.y + settings.mapHeight - cell.r) / BITGRID_TILE_SIZE);
-	const ymax = ~~((cell.y + settings.mapHeight + cell.r) / BITGRID_TILE_SIZE);
+	const xmin = ((cell.x + settings.worldMapW - cell.r) / BITGRID_TILE_SIZE) & 0x1f;
+	const xmax = ((cell.x + settings.worldMapW + cell.r) / BITGRID_TILE_SIZE) & 0x1f;
+	const ymin = ((cell.y + settings.worldMapH - cell.r) / BITGRID_TILE_SIZE) & 0x1f;
+	const ymax = ((cell.y + settings.worldMapH + cell.r) / BITGRID_TILE_SIZE) & 0x1f;
 	
 	if (xmin === bgXmin && xmax === bgXmax && ymin === bgYmin && ymax === bgYmax) return; // shortcut
 	cell.bgXmin = xmin; cell.bgXmax = xmax; cell.bgYmin = ymin; cell.bgYmax = ymax;
@@ -60,9 +70,9 @@ const bitgridUpdate = cell => {
 };
 
 const bitgridRemove = cell => {
-	const { xmin, xmax, ymin, ymax } = cell;
-	for (let x = xmin; x <= xmax; ++x) {
-		for (let y = ymin; y <= ymax; ++y) {
+	const { bgXmin, bgXmax, bgYmin, bgYmax } = cell;
+	for (let x = bgXmin; x <= bgXmax; ++x) {
+		for (let y = bgYmin; y <= bgYmax; ++y) {
 			bitgridTiles[y * 32 + x].delete(cell);
 		}
 	}
@@ -72,7 +82,7 @@ const bitgridSearch = (xmin, xmax, ymin, ymax, cb) => {
 	for (let x = xmin; x <= xmax; ++x) {
 		for (let y = ymin; y <= ymax; ++y) {
 			for (const cell of bitgridTiles[y * 32 + x]) {
-				if (xmin <= cell.xmin && cell.xmin < x && ymin <= cell.ymin && cell.ymin < y) continue; // no duplicates
+				if ((xmin <= cell.bgXmin && cell.bgXmin < x) || (ymin <= cell.bgYmin && cell.bgYmin < y)) continue; // no duplicates
 				if (cb(cell)) return true;
 			}
 		}
@@ -96,6 +106,7 @@ const PLAYER_OWNER_SERVER = {
 	mouseY: 0,
 	name: EMPTY_STRING,
 	owned: new Set(),
+	rgb: 0x7f7f7f,
 	q: false,
 	showClanmates: false,
 	skin: EMPTY_STRING,
@@ -108,16 +119,21 @@ const PLAYER_OWNER_SERVER = {
 	w: false,
 	ws: {},
 }
+const PLAYER_BOT_NAMES = settings.worldPlayerBotNames.map(x => encodeUtf8(x.replace('{*}', '')));
+const PLAYER_BOT_SKINS = settings.worldPlayerBotSkins.map(encodeUtf8);
+
+const tickTimes = [];
 
 const boostingCells = [];
 const playerCells = [];
 const players = new Set();
+const playerBotAi = new WeakMap();
 let nextCellId = 1;
 let now = 0; // current tick
 let pellets = 0;
 let viruses = 0;
 
-let statsBuffer = Buffer.from('{}\0');
+let statsBuffer = Buffer.concat([Buffer.from([0xfe]), Buffer.from('{}\0')]);
 
 const randomColors = new Uint32Array(1536);
 for (let shade = 0; shade < 256; ++shade) {
@@ -129,24 +145,24 @@ for (let shade = 0; shade < 256; ++shade) {
 }
 
 const bounce = (cell, fromBoost) => {
-	if (cell.x - cell.r < -settings.mapWidth) {
-		cell.x = -settings.mapWidth + cell.r;
+	const r = cell.r / 2;
+	if (cell.x - r < -settings.worldMapW) {
+		cell.x = -settings.worldMapW + r;
 		if (fromBoost) cell.boostUnitX *= -1;
-	} else if (settings.mapWidth < cell.x + cell.r) {
-		cell.x = settings.mapWidth - cell.r;
+	} else if (settings.worldMapW < cell.x + r) {
+		cell.x = settings.worldMapW - r;
 		if (fromBoost) cell.boostUnitX *= -1;
 	}
-	if (cell.y - cell.r < -settings.mapWidth) {
-		cell.y = -settings.mapWidth + cell.r;
+	if (cell.y - r < -settings.worldMapW) {
+		cell.y = -settings.worldMapW + r;
 		if (fromBoost) cell.boostUnitY *= -1;
-	} else if (settings.mapWidth < cell.y + cell.r) {
-		cell.y = settings.mapWidth - cell.r;
+	} else if (settings.worldMapW < cell.y + r) {
+		cell.y = settings.worldMapW - r;
 		if (fromBoost) cell.boostUnitY *= -1;
 	}
 };
 
 const launch = (cell, radius, boostUnitX, boostUnitY, boostMagnitude) => {
-	cell.r = Math.sqrt(cell.r * cell.r - radius * radius);
 	const newCell = {
 		type: CELL_TYPE_PLAYER,
 		id: nextCellId++,
@@ -155,7 +171,6 @@ const launch = (cell, radius, boostUnitX, boostUnitY, boostMagnitude) => {
 		r: radius,
 		rgb: cell.rgb,
 		born: now,
-		changed: now,
 		moved: now,
 		dead: false,
 		deadTo: 0,
@@ -165,10 +180,11 @@ const launch = (cell, radius, boostUnitX, boostUnitY, boostMagnitude) => {
 		boostMagnitude,
 		encodingMove: EMPTY_BUFFER,
 		encodingFirst: EMPTY_BUFFER,
+		mergeable: false,
 	};
 	encode(newCell);
 	bitgridAdd(newCell);
-	owner.owned.add(newCell);
+	cell.owner.owned.add(newCell);
 	boostingCells.push(newCell);
 	playerCells.push(newCell);
 };
@@ -182,11 +198,11 @@ const remove = cell => {
 	// the cell will be removed from boostingCells and playerCells later
 };
 
-const CELL_EAT_SIZE_FACTOR = Math.sqrt(1.3); // cells must have 1.3x mass, so sqrt(1.3)x the radius
 const leftEatsRight = (leftCell, rightCell) => {
 	if (leftCell.type === CELL_TYPE_PLAYER) {
 		// players eat everything, but minions only eat minions
-		if (rightCell.type === CELL_TYPE_PLAYER && leftCell.owner.minion && !rightCell.owner.minion) return false;
+		if (leftCell.owner.minionCommander && !rightCell.owner.minionCommander) return false;
+		if (leftCell.owner === rightCell.owner && (!leftCell.mergeable || !rightCell.mergeable)) return false;
 	} else if (leftCell.type === CELL_TYPE_PELLET) {
 		// pellets don't eat anything
 		return false;
@@ -198,7 +214,8 @@ const leftEatsRight = (leftCell, rightCell) => {
 		return false;
 	}
 
-	return leftCell.r * CELL_EAT_SIZE_FACTOR > rightCell.r;
+	return leftCell.r > rightCell.r * settings.worldEatMult
+		&& Math.hypot(leftCell.x - rightCell.x, leftCell.y - rightCell.y) <= leftCell.r - rightCell.r / settings.worldEatOverlapDiv;
 };
 const leftCollidesRight = (leftCell, rightCell) => {
 	if (leftCell.type === CELL_TYPE_EJECT && rightCell.type === CELL_TYPE_EJECT) return true;
@@ -212,18 +229,20 @@ const leftCollidesRight = (leftCell, rightCell) => {
 		leftLifetime >= 25 * (settings.playerMergeTime + leftCell.r * settings.playerMergeTimeIncrease);
 	rightCell.mergeable ||=
 		rightLifetime >= 25 * (settings.playerMergeTime + rightCell.r * settings.playerMergeTimeIncrease);
-	return leftCell.mergeable && rightCell.mergeable;
+	return (!leftCell.mergeable || !rightCell.mergeable)
+		&& leftLifetime >= settings.playerNoCollideDelay
+		&& rightLifetime >= settings.playerNoCollideDelay;
 };
 
 const safeSpawnPos = (radius) => {
 	for (let i = 0; i < settings.worldSafeSpawnTries; ++i) {
-		const x = (Math.random() * 2 - 1) * (settings.mapWidth - radius);
-		const y = (Math.random() * 2 - 1) * (settings.mapHeight - radius);
+		const x = (Math.random() * 2 - 1) * (settings.worldMapW - radius);
+		const y = (Math.random() * 2 - 1) * (settings.worldMapH - radius);
 
-		const xmin = ~~((x + settings.mapWidth - radius) / BITGRID_TILE_SIZE);
-		const xmax = ~~((x + settings.mapWidth + radius) / BITGRID_TILE_SIZE);
-		const ymin = ~~((y + settings.mapHeight - radius) / BITGRID_TILE_SIZE);
-		const ymax = ~~((y + settings.mapHeight + radius) / BITGRID_TILE_SIZE);
+		const xmin = ((x + settings.worldMapW - radius) / BITGRID_TILE_SIZE) & 0x1f;
+		const xmax = ((x + settings.worldMapW + radius) / BITGRID_TILE_SIZE) & 0x1f;
+		const ymin = ((y + settings.worldMapH - radius) / BITGRID_TILE_SIZE) & 0x1f;
+		const ymax = ((y + settings.worldMapH + radius) / BITGRID_TILE_SIZE) & 0x1f;
 		if (!bitgridSearch(xmin, xmax, ymin, ymax, cell => {
 			if (cell.type === CELL_TYPE_PELLET) return;
 			if (x - radius <= cell.x + cell.r && cell.x - cell.r <= x + radius
@@ -234,8 +253,8 @@ const safeSpawnPos = (radius) => {
 		}
 	}
 
-	const x = (Math.random() * 2 - 1) * (settings.mapWidth - radius);
-	const y = (Math.random() * 2 - 1) * (settings.mapHeight - radius);
+	const x = (Math.random() * 2 - 1) * (settings.worldMapW - radius);
+	const y = (Math.random() * 2 - 1) * (settings.worldMapH - radius);
 	return [x, y];
 };
 
@@ -247,7 +266,7 @@ const encode = cell => {
 	move.writeUInt32LE(cell.id, 0);
 	move.writeInt16LE(cell.x, 4);
 	move.writeInt16LE(cell.y, 6);
-	move.writeInt16LE(cell.r, 8);
+	move.writeUInt16LE(cell.r, 8);
 
 	let flags = 0;
 	if (cell.type === CELL_TYPE_VIRUS) flags |= 1;
@@ -260,21 +279,47 @@ const encode = cell => {
 	cell.owner.clan.copy(move, 14);
 
 	let first = cell.encodingFirst;
-	const firstByteLength = moveByteLength + 3 + cell.owner.name.byteLength + cell.owner.skin.byteLength;
+	const firstByteLength = moveByteLength + 3 + cell.owner.skin.byteLength + cell.owner.name.byteLength;
 	if (first.byteLength !== firstByteLength) cell.encodingFirst = first = Buffer.alloc(firstByteLength);
 	move.copy(first);
-	move.writeUInt8(flags | 0x02 | 0x04 | 0x08, 10); // add more flags (color, name, skin)
+	first.writeUInt8(flags | 0x02 | 0x04 | 0x08, 10); // add more flags (color, name, skin)
 
 	let o = move.byteLength;
-	move.writeUInt32LE(cell.rgb, o); // this will never overflow the bounds of `first`
+	first.writeUInt32LE(cell.rgb, o); // this will never overflow the bounds of `first`
 	o += 3;
-	cell.owner.name.copy(first, o);
-	o += cell.owner.name.byteLength;
 	cell.owner.skin.copy(first, o);
+	o += cell.owner.skin.byteLength;
+	cell.owner.name.copy(first, o);
 
 	cell.encodingMove = move;
 	cell.encodingFirst = first;
 };
+
+const MINION_SPAWN = { name: encodeUtf8(' '), skin: EMPTY_STRING, spectating: false, sub: false };
+
+for (let i = 0; i < settings.worldPlayerBotsPerWorld; ++i) {
+	players.add({
+		bot: true,
+		camera: { x: 0, y: 0, scale: 1 },
+		clan: EMPTY_STRING,
+		disconnectedAt: 0,
+		minionCommander: undefined,
+		mouseX: 0,
+		mouseY: 0,
+		name: EMPTY_STRING,
+		owned: new Set(),
+		rgb: 0x7f7f7f,
+		q: false,
+		showClanmates: false,
+		skin: EMPTY_STRING,
+		spawn: undefined,
+		splits: 0,
+		state: PLAYER_STATE_IDLE,
+		sub: false,
+		visibleCells: new Set(),
+		w: false,
+	});
+}
 
 const worldEatArray = [];
 const worldRigidArray = [];
@@ -283,7 +328,7 @@ const worldTick = () => {
 
 	// #1 update world
 
-	// TODO: adjust cell ids if they get too high
+	if (nextCellId >= 4e9) nextCellId = 1;
 
 	for (; pellets < settings.pelletCount; ++pellets) {
 		const [x, y] = safeSpawnPos(settings.pelletMinSize); // TODO, this should probably not be safeSpawnPos
@@ -296,7 +341,6 @@ const worldTick = () => {
 			rgb: randomColors[~~(Math.random() * 256 * 6)],
 			born: now,
 			moved: now,
-			changed: now,
 			dead: false,
 			deadTo: 0,
 			owner: PLAYER_OWNER_SERVER,
@@ -305,23 +349,24 @@ const worldTick = () => {
 			boostMagnitude: 0,
 			encodingMove: EMPTY_BUFFER,
 			encodingFirst: EMPTY_BUFFER,
+			mergeable: false,
+			fed: 0,
 		};
 		encode(pellet);
 		bitgridAdd(pellet);
 	}
 
-	for (; viruses < settings.virusCount; ++viruses) {
+	for (; viruses < settings.virusMinCount; ++viruses) {
 		const [x, y] = safeSpawnPos(settings.virusSize);
 		const virus = {
 			type: CELL_TYPE_VIRUS,
 			id: nextCellId++,
-			x: Math.random() * (settings.mapWidth - settings.virusSize),
-			y: Math.random() * (settings.mapHeight - settings.virusSize),
+			x,
+			y,
 			r: settings.virusSize,
 			rgb: 0x33ff33,
 			born: now,
 			moved: now,
-			changed: now,
 			dead: false,
 			deadTo: 0,
 			owner: PLAYER_OWNER_SERVER,
@@ -330,6 +375,8 @@ const worldTick = () => {
 			boostMagnitude: 0,
 			encodingMove: EMPTY_BUFFER,
 			encodingFirst: EMPTY_BUFFER,
+			mergeable: false,
+			fed: 0,
 		};
 		encode(virus);
 		bitgridAdd(virus);
@@ -339,8 +386,9 @@ const worldTick = () => {
 		const cell = boostingCells[i];
 		cell.x += cell.boostUnitX * cell.boostMagnitude / 9;
 		cell.y += cell.boostUnitY * cell.boostMagnitude / 9;
-		cell.boostMagnitude -= 1;
+		cell.boostMagnitude *= 8 / 9;
 
+		bounce(cell, true);
 		cell.moved = now;
 		encode(cell);
 		bitgridUpdate(cell);
@@ -348,7 +396,7 @@ const worldTick = () => {
 	let j = 0; // remove non-boosting cells all at once
 	for (let i = 0, l = boostingCells.length; i < l; ++i) {
 		boostingCells[j] = boostingCells[i];
-		if (boostingCells[i].boostMagnitude > 0) ++j;
+		if (boostingCells[i].boostMagnitude >= 1) ++j;
 	}
 	boostingCells.length = j;
 
@@ -361,7 +409,7 @@ const worldTick = () => {
 	for (let i = 0, l = boostingCells.length; i < l; ++i) {
 		const cell = boostingCells[i];
 		if (cell.type === CELL_TYPE_PLAYER) continue;
-		bitgridSearch(cell.xmin, cell.xmax, cell.ymin, cell.ymax, otherCell => {
+		bitgridSearch(cell.bgXmin, cell.bgXmax, cell.bgYmin, cell.bgYmax, otherCell => {
 			if (cell === otherCell) return;
 			else if (leftCollidesRight(cell, otherCell)) rigid[rigidL++] = cell, rigid[rigidL++] = otherCell;
 			else if (leftEatsRight(cell, otherCell)) eat[eatL++] = cell, eat[eatL++] = otherCell;
@@ -375,10 +423,10 @@ const worldTick = () => {
 		if (!owner.disconnectedAt) {
 			let dx = owner.mouseX - cell.x;
 			let dy = owner.mouseY - cell.y;
-			const d = Math.hypot(dx, dy);
+			let d = Math.hypot(dx, dy);
 			if (d >= 1) {
 				// no idea where -0.4396754 comes from
-				const realDistance = Math.min(d, 88 * (this.size ** -0.4396754)) * settings.playerMoveMult;
+				const realDistance = Math.min(d, 88 * (cell.r ** -0.4396754)) * settings.playerMoveMult;
 				cell.x += dx / d * realDistance;
 				cell.y += dy / d * realDistance;
 			}
@@ -398,7 +446,7 @@ const worldTick = () => {
 			cell.r = splitSize;
 		}
 
-		bounce(cell);
+		bounce(cell, false);
 		cell.moved = now;
 		encode(cell);
 		bitgridUpdate(cell);
@@ -406,7 +454,7 @@ const worldTick = () => {
 
 	for (let i = 0, l = playerCells.length; i < l; ++i) {
 		const cell = playerCells[i];
-		bitgridSearch(cell.xmin, cell.xmax, cell.ymin, cell.ymax, otherCell => {
+		bitgridSearch(cell.bgXmin, cell.bgXmax, cell.bgYmin, cell.bgYmax, otherCell => {
 			if (cell === otherCell) return;
 			else if (leftCollidesRight(cell, otherCell)) rigid[rigidL++] = cell, rigid[rigidL++] = otherCell;
 			else if (leftEatsRight(cell, otherCell)) eat[eatL++] = cell, eat[eatL++] = otherCell;
@@ -414,27 +462,29 @@ const worldTick = () => {
 		});
 	}
 
+	const compileInteractionsTime = performance.now() - start;
+
 	for (let i = 0; i < rigidL; i += 2) {
 		const a = rigid[i];
 		const b = rigid[i + 1];
 
-		const dx = b.x - a.x;
-		const dy = b.y - a.y;
-		const d = Math.hypot(dx, dy);
+		let dx = b.x - a.x;
+		let dy = b.y - a.y;
+		let d = Math.hypot(dx, dy);
 		const extraSpace = a.r + b.r - d;
 		if (extraSpace <= 0) continue;
 		if (d === 0) d = 1, dx = 1, dy = 0;
 
 		const massA = a.r * a.r;
 		const massB = b.r * b.r;
-		const factorA = massA / (massA + massB);
-		const factorB = massB / (massA + massB);
+		const factorA = massB / (massA + massB);
+		const factorB = massA / (massA + massB);
 		a.x -= dx / d * extraSpace * factorA;
 		a.y -= dy / d * extraSpace * factorA;
 		b.x += dx / d * extraSpace * factorB;
 		b.y += dy / d * extraSpace * factorB;
 
-		bounce(a); bounce(b);
+		bounce(a, false); bounce(b, false);
 		a.moved = b.moved = now;
 		encode(a); encode(b);
 		bitgridUpdate(a); bitgridUpdate(b); // TODO maybe defer this if possible
@@ -445,6 +495,8 @@ const worldTick = () => {
 		const b = eat[i + 1];
 		if (a.dead || b.dead) continue;
 
+		if (a.type === CELL_TYPE_VIRUS && b.type === CELL_TYPE_EJECT && viruses >= settings.virusMaxCount) continue; 
+
 		const dx = b.x - a.x;
 		const dy = b.y - a.y;
 		const d = Math.hypot(dx, dy);
@@ -452,6 +504,75 @@ const worldTick = () => {
 
 		a.r = Math.sqrt(a.r * a.r + b.r * b.r);
 		a.moved = now;
+
+		if (a.type === CELL_TYPE_VIRUS && b.type === CELL_TYPE_EJECT && ++a.fed >= settings.virusFeedTimes) {
+			a.fed = 0;
+			a.r = settings.virusSize;
+			const angle = Math.atan2(b.boostUnitY, b.boostUnitX);
+			const virus = {
+				type: CELL_TYPE_VIRUS,
+				id: nextCellId++,
+				x: a.x,
+				y: a.y,
+				r: settings.virusSize,
+				rgb: 0x33ff33,
+				born: now,
+				moved: now,
+				dead: false,
+				deadTo: 0,
+				owner: PLAYER_OWNER_SERVER,
+				boostUnitX: Math.cos(angle),
+				boostUnitY: Math.sin(angle),
+				boostMagnitude: settings.virusSplitBoost,
+				encodingMove: EMPTY_BUFFER,
+				encodingFirst: EMPTY_BUFFER,
+				mergeable: false,
+				fed: 0,
+			};
+			encode(virus);
+			bitgridAdd(virus);
+			boostingCells.push(virus);
+			++viruses;
+		}
+
+		if (b.type === CELL_TYPE_VIRUS && a.type === CELL_TYPE_PLAYER) {
+			let cellsLeft = settings.playerMaxCells - a.owner.owned.size;
+			if (cellsLeft > 0) {
+				const splitMinMass = settings.playerMinSplitSize * settings.playerMinSplitSize;
+				let mass = a.r * a.r;
+				// just gonna copy this blindly because this logic is really weird
+				if (mass / cellsLeft < splitMinMass) {
+					let amount = 2, perPiece = 1;
+					while ((perPiece = mass / (amount + 1)) >= splitMinMass && amount * 2 <= cellsLeft) {
+						amount *= 2;
+					}
+					const radius = Math.sqrt(perPiece);
+					for (let i = 0; i < amount; ++i) {
+						const angle = Math.random() * 2 * Math.PI;
+						launch(a, radius, Math.cos(angle), Math.sin(angle), settings.playerSplitBoost);
+					}
+					a.r = radius;
+				} else {
+					let nextMass = mass / 2;
+					a.r = Math.sqrt(mass / 2);
+					let massLeft = mass / 2;
+					while (cellsLeft > 0) {
+						if (nextMass / cellsLeft < splitMinMass) break;
+						while (nextMass >= massLeft && cellsLeft > 1)
+							nextMass /= 2;
+						const angle = Math.random() * 2 * Math.PI;
+						launch(a, Math.sqrt(nextMass), Math.cos(angle), Math.sin(angle), settings.playerSplitBoost);
+						massLeft -= nextMass;
+						--cellsLeft;
+					}
+					const radius = Math.sqrt(massLeft / cellsLeft);
+					for (let i = 0; i < cellsLeft; ++i) {
+						const angle = Math.random() * 2 * Math.PI;
+						launch(a, radius, Math.cos(angle), Math.sin(angle), settings.playerSplitBoost);
+					}
+				}
+			}
+		}
 		encode(a);
 		bitgridUpdate(a);
 
@@ -473,6 +594,8 @@ const worldTick = () => {
 		if (!playerCells[i].dead) ++j;
 	}
 	playerCells.length = j;
+
+	const gameUpdateTime = performance.now() - start - compileInteractionsTime;
 
 	// now update players
 	// find the largest player first
@@ -503,17 +626,18 @@ const worldTick = () => {
 		} else {
 			// split
 			for (let i = 0; i < player.splits; ++i) {
+				let remaining = player.owned.size;
 				for (const cell of player.owned) {
-					if (player.owned.size >= settings.playerMaxCells) break;
+					if (player.owned.size >= settings.playerMaxCells || !remaining--) break;
 					if (cell.r < settings.playerMinSplitSize) continue;
 
 					let dx = player.mouseX - cell.x;
 					let dy = player.mouseY - cell.y;
 					let d = Math.hypot(dx, dy);
 					if (d < 1) d = 1, dx = 1, dy = 0;
-					launch(cell, cell.r / settings.playerSplitSizeDiv, dx / d, dy / d, d);
+					launch(cell, cell.r / settings.playerSplitSizeDiv, dx / d, dy / d, settings.playerSplitBoost);
 
-					cell.r *= 1 - 1 / settings.playerSplitSizeDiv;
+					cell.r /= settings.playerSplitSizeDiv;
 					cell.moved = now;
 					encode(cell);
 					bitgridUpdate(cell);
@@ -530,7 +654,7 @@ const worldTick = () => {
 					let d = Math.hypot(dx, dy);
 					if (d < 1) d = 1, dx = 1, dy = 0;
 
-					const angle = Math.atan2(dx, dy) + (Math.random() * 2 - 1) * settings.ejectDispersion;
+					const angle = Math.atan2(dy, dx) + (Math.random() * 2 - 1) * settings.ejectDispersion;
 					const eject = {
 						type: CELL_TYPE_EJECT,
 						id: nextCellId++,
@@ -540,7 +664,6 @@ const worldTick = () => {
 						rgb: cell.rgb,
 						born: now,
 						moved: now,
-						changed: now,
 						dead: false,
 						deadTo: 0,
 						owner: PLAYER_OWNER_SERVER,
@@ -549,6 +672,8 @@ const worldTick = () => {
 						boostMagnitude: settings.ejectedCellBoost,
 						encodingMove: EMPTY_BUFFER,
 						encodingFirst: EMPTY_BUFFER,
+						mergeable: false,
+						fed: 0,
 					};
 					bitgridAdd(eject);
 					encode(eject);
@@ -558,32 +683,39 @@ const worldTick = () => {
 					encode(cell);
 					bitgridUpdate(cell);
 				}
+				player.w = false;
 			}
 
 			// q press, and update state
 			if (player.q) {
-				if (player.state === PLAYER_STATE_ROAM) player.state = PLAYER_STATE_SPECTATE;
+				if (player.state === PLAYER_STATE_ROAM || player.state === PLAYER_STATE_IDLE) player.state = PLAYER_STATE_SPECTATE;
 				else if (player.state === PLAYER_STATE_SPECTATE) player.state = PLAYER_STATE_ROAM;
+				player.q = false;
 			}
 			if (player.state === PLAYER_STATE_SPECTATE && !largestPlayer) player.state = PLAYER_STATE_ROAM;
 
 			// spawn request
 			if (!player.owned.size) {
 				if (!player.spawn && player.state === PLAYER_STATE_PLAYING) player.state = PLAYER_STATE_IDLE;
-				else if (player.spawn) {
-					// TODO: what if a player is in limbo?
-					if (player.spawn.spectating) player.state = PLAYER_STATE_ROAM;
+				else if (player.spawn && player.state !== PLAYER_STATE_LIMBO) {
+					if (player.spawn.spectating) player.state = PLAYER_STATE_SPECTATE;
 					else {
-						const [x, y] = safeSpawnPos(settings.playerSpawnSize);
+						player.name = player.spawn.name;
+						player.skin = player.spawn.skin;
+						player.sub = player.spawn.sub;
+						player.state = PLAYER_STATE_PLAYING;
+
+						const spawnSize = player.minionCommander ? settings.minionSpawnSize : settings.playerSpawnSize;
+						const [x, y] = safeSpawnPos(spawnSize);
+						const rgb = randomColors[~~(Math.random() * 256 * 6)];
 						const cell = {
 							type: CELL_TYPE_PLAYER,
 							id: nextCellId++,
-							x: cell.x + settings.playerSplitDistance * boostUnitX,
-							y: cell.y + settings.playerSplitDistance * boostUnitY,
-							r: settings.playerSpawnSize,
-							rgb: randomColors[~~(Math.random() * 256 * 6)],
+							x,
+							y,
+							r: spawnSize,
+							rgb,
 							born: now,
-							changed: now,
 							moved: now,
 							dead: false,
 							deadTo: 0,
@@ -593,16 +725,14 @@ const worldTick = () => {
 							boostMagnitude: 0,
 							encodingMove: EMPTY_BUFFER,
 							encodingFirst: EMPTY_BUFFER,
+							mergeable: false,
+							fed: 0,
 						};
+						player.rgb = rgb;
 						player.owned.add(cell);
 						bitgridAdd(cell);
 						encode(cell);
 						playerCells.push(cell);
-
-						player.name = player.spawn.name;
-						player.skin = player.spawn.skin;
-						player.sub = player.spawn.sub;
-						player.state = PLAYER_STATE_PLAYING;
 					}
 				}
 			}
@@ -617,8 +747,8 @@ const worldTick = () => {
 					r += cell.r;
 				}
 				player.camera = {
-					x: x / player.owned.size,
-					y: y / player.owned.size,
+					x: (x / player.owned.size) || 0,
+					y: (y / player.owned.size) || 0,
 					scale: Math.min(64 / r, 1) ** 0.4,
 				};
 			} else if (player.state === PLAYER_STATE_ROAM) {
@@ -628,8 +758,8 @@ const worldTick = () => {
 				const distance = Math.min(d, settings.playerRoamSpeed);
 				if (distance >= 1) {
 					player.camera = {
-						x: Math.min(Math.max(player.camera.x + dx / d * distance, -settings.mapWidth), settings.mapWidth),
-						y: Math.min(Math.max(player.camera.y + dy / d * distance, -settings.mapWidth), settings.mapWidth),
+						x: Math.min(Math.max(player.camera.x + dx / d * distance, -settings.worldMapW), settings.worldMapW),
+						y: Math.min(Math.max(player.camera.y + dy / d * distance, -settings.worldMapW), settings.worldMapW),
 						scale: settings.playerRoamViewScale,
 					};
 				}
@@ -644,7 +774,7 @@ const worldTick = () => {
 	let playingInternal = 0;
 	let spectating = 0;
 	for (const player of players) {
-		if (player.owner.minionCommander || player.owner.bot) ++playingInternal;
+		if (player.minionCommander || player.bot) ++playingInternal;
 		else if (player.state === PLAYER_STATE_PLAYING) ++playingExternal;
 		else if (player.state === PLAYER_STATE_ROAM || player.state === PLAYER_STATE_SPECTATE) ++spectating;
 	}
@@ -661,21 +791,21 @@ const worldTick = () => {
 	const minionsPerPlayer = new Map();
 	// remove extra minions
 	for (const player of players) {
-		if (!player.owner.minionCommander) continue;
-		let minions = minionsPerPlayer.get(player.owner.minionCommander) || 0;
-		if (minions > targetMinionsPerPlayer || player.owner.state !== PLAYER_STATE_PLAYING) {
+		if (!player.minionCommander) continue;
+		let minions = minionsPerPlayer.get(player.minionCommander) || 0;
+		if (minions > targetMinionsPerPlayer || player.minionCommander.state !== PLAYER_STATE_PLAYING) {
 			players.delete(player);
 			player.disconnectedAt = -Infinity; // make sure its cells are immediately deleted
 		} else {
-			minionsPerPlayer.set(player.owner.minionCommander, minions + 1);
+			minionsPerPlayer.set(player.minionCommander, minions + 1);
 		}
 	}
 
 	// add new minions
 	for (const player of players) {
-		if (player.owner.minionCommander || player.owner.bot) continue;
-		if (player.owner.state !== PLAYER_STATE_PLAYING) continue;
-		let minions = minionsPerPlayer.get(player.owner.minionCommander) || 0;
+		if (player.minionCommander || player.bot) continue;
+		if (player.state !== PLAYER_STATE_PLAYING) continue;
+		let minions = minionsPerPlayer.get(player) || 0;
 		for (; minions < targetMinionsPerPlayer; ++minions) {
 			players.add({
 				bot: false,
@@ -687,6 +817,7 @@ const worldTick = () => {
 				mouseY: 0,
 				name: EMPTY_STRING,
 				owned: new Set(),
+				rgb: 0x7f7f7f,
 				q: false,
 				showClanmates: false,
 				skin: EMPTY_STRING,
@@ -694,6 +825,7 @@ const worldTick = () => {
 				splits: 0,
 				state: PLAYER_STATE_IDLE,
 				sub: false,
+				visibleCells: new Set(),
 				w: false,
 			});
 		}
@@ -701,7 +833,7 @@ const worldTick = () => {
 
 	// compile statistics
 	const loadTime = performance.now() - start;
-	statsBuffer = Buffer.from(JSON.stringify({
+	statsBuffer = Buffer.concat([Buffer.from([0xfe]), Buffer.from(JSON.stringify({
 		limit: settings.listenerMaxConnections,
 		internal: playingInternal, // might be outdated by one tick, but that's okay
 		external: playingExternal + spectating,
@@ -709,8 +841,8 @@ const worldTick = () => {
 		spectating,
 		name: settings.serverName,
 		gamemode: 'FFA',
-		loadTime: performance.now() - start,
-		uptime: ~~(performance.now() - serverStartTime),
+		loadTime: tickTimes[(now - 1 + 25) % 25],
+		uptime: ~~((performance.now() - serverStartTime) / 1000),
 		// legacy
 		mode: 'FFA',
 		update: loadTime,
@@ -718,9 +850,25 @@ const worldTick = () => {
 		playersAlive: playingExternal,
 		playersSpect: spectating,
 		playersLimit: settings.listenerMaxConnections,
-	}));
+	}))]);
+
+	// compile leaderboard
+	const leaderboard = [];
+	if (now % 4 === 0) {
+		for (const player of players) {
+			let mass = 0;
+			for (const cell of player.owned) {
+				mass += cell.r * cell.r;
+			}
+			if (mass) leaderboard.push({ player, mass });
+		}
+		leaderboard.sort((a, b) => b.mass - a.mass);
+	}
+
+	const updatePlayersTime = performance.now() - start - gameUpdateTime;
 
 	// #2 update connections
+	let botsSeen = 0;
 	for (const player of players) {
 		if (player.disconnectedAt) continue;
 		if (now - player.updated >= 60 * 25) {
@@ -736,28 +884,157 @@ const worldTick = () => {
 			continue;
 		}
 
-		const visibleCells = new Set();
+		if (player.minionCommander) {
+			player.mouseX = player.minionCommander.mouseX;
+			player.mouseY = player.minionCommander.mouseY;
+			player.splits = 1;
+			if (!player.owned.size) player.spawn = MINION_SPAWN;
+			continue;
+		}
+
+		let visibleCells = new Set(player.owned);
 		const cameraWidth = 1920 / player.camera.scale / 2 * settings.playerViewScaleMult;
 		const cameraHeight = 1080 / player.camera.scale / 2 * settings.playerViewScaleMult;
 		const cameraXmin = player.camera.x - cameraWidth;
 		const cameraXmax = player.camera.x + cameraWidth;
 		const cameraYmin = player.camera.y - cameraHeight;
 		const cameraYmax = player.camera.y + cameraHeight;
-		const xmin = ~~(Math.max(cameraXmin + settings.mapWidth, 0) / BITGRID_TILE_SIZE);
-		const xmax = ~~(Math.min(cameraXmax + settings.mapWidth, settings.mapWidth * 2) / BITGRID_TILE_SIZE);
-		const ymin = ~~(Math.max(cameraYmin + settings.mapHeight, 0) / BITGRID_TILE_SIZE);
-		const ymax = ~~(Math.min(cameraYmax + settings.mapHeight, settings.mapHeight * 2) / BITGRID_TILE_SIZE);
-		bitgridSearch(xmin, xmax, ymin, ymax, cell => {
-			if (cameraXmin <= cell.x + cell.r && cell.x - cell.r <= cameraXmax
-				&& cameraYmin <= cell.y + cell.r && cell.y - cell.r <= cameraYmax) {
-				visibleCells.add(cell);
+		const xmin = ~~(Math.max(cameraXmin + settings.worldMapW, 0) / BITGRID_TILE_SIZE);
+		const xmax = ~~(Math.min(cameraXmax + settings.worldMapW, settings.worldMapW * 2) / BITGRID_TILE_SIZE);
+		const ymin = ~~(Math.max(cameraYmin + settings.worldMapH, 0) / BITGRID_TILE_SIZE);
+		const ymax = ~~(Math.min(cameraYmax + settings.worldMapH, settings.worldMapH * 2) / BITGRID_TILE_SIZE);
+		if (!player.bot || now % settings.worldPlayerBotsPerWorld === botsSeen++) {
+			// only compute bots' new visible cells once in a while
+			bitgridSearch(xmin, xmax, ymin, ymax, cell => {
+				if (cameraXmin <= cell.x + cell.r && cell.x - cell.r <= cameraXmax
+					&& cameraYmin <= cell.y + cell.r && cell.y - cell.r <= cameraYmax) {
+					visibleCells.add(cell);
+				}
+			});
+		} else visibleCells = player.visibleCells;
+
+		if (player.bot) {
+			// copied straight from OgarII, just like everything else, not my logic
+			let ai = playerBotAi.get(player);
+			if (!ai) playerBotAi.set(player, ai = { splitCooldownTicks: 0, target: undefined });
+
+			if (ai.splitCooldownTicks) --ai.splitCooldownTicks;
+			else ai.target = undefined;
+
+			if (player.state !== PLAYER_STATE_PLAYING) {
+				player.spawn = {
+					name: PLAYER_BOT_NAMES[~~(Math.random() * PLAYER_BOT_NAMES.length)],
+					skin: PLAYER_BOT_SKINS[~~(Math.random() * PLAYER_BOT_SKINS.length)],
+					spectating: false,
+					sub: false,
+				};
+				continue;
 			}
-		});
+
+			let leader;
+			for (const cell of player.owned) {
+				if (!leader || cell.r > leader.r) leader = cell;
+			}
+			if (!leader) continue;
+
+			if (ai.target) {
+				if (ai.target.dead || cell.r <= ai.target.r * settings.worldEatMult) {
+					ai.target = undefined;
+				} else {
+					player.mouseX = ai.target.x;
+					player.mouseY = ai.target.y;
+					continue;
+				}
+			}
+
+			let mouseX = 0;
+			let mouseY = 0;
+			let bestPrey = undefined;
+			let splitKillObstacleNearby = false;
+
+			const splitDistance = Math.max(leader.r / settings.playerSplitSizeDiv, settings.playerSplitBoost); 
+
+			for (const cell of visibleCells) {
+				const dx = cell.x - leader.x;
+				const dy = cell.y - leader.y;
+				const dSplit = Math.max(1, Math.hypot(dx, dy));
+				const d = Math.max(1, dSplit - cell.r - leader.r);
+				let influence = 0;
+
+				if (cell.type === CELL_TYPE_PELLET) {
+					influence = 1;
+				} else {
+					const truncatedInfluence = Math.log10(cell.r * cell.r);
+					const canSplitKill = leader.r / settings.playerSplitSizeDiv > cell.r * settings.worldEatMult
+						&& d - splitDistance <= leader.r - cell.r / settings.worldEatOverlapDiv;
+					const canEat = leader.r >= cell.r * settings.worldEatMult;
+					if (cell.type === CELL_TYPE_PLAYER) {
+						if (cell.owner !== player) {
+							if (canEat) {
+								influence = truncatedInfluence;
+								if (canSplitKill && (!bestPrey || cell.r > bestPrey.r)) bestPrey = cell;
+							}
+						} else {
+							if (cell.r < leader.r * settings.worldEatMult) influence = -1;
+							else influence = -truncatedInfluence * player.owned.size;
+							splitKillObstacleNearby = true;
+						}
+					} else if (cell.type === CELL_TYPE_VIRUS) {
+						if (player.owned.size >= settings.playerMaxCells) influence = truncatedInfluence;
+						else if (canEat) {
+							influence = -1 * player.owned.size;
+							if (canSplitKill) splitKillObstacleNearby = true;
+						}
+					} else if (cell.type === CELL_TYPE_EJECT) {
+						influence = truncatedInfluence * player.owned.size;
+					}
+				}
+
+				if (d === 0) d = 1;
+				mouseX += dx / d * influence / d;
+				mouseY += dy / d * influence / d;
+
+				if (player.owned.size <= 2 && !splitKillObstacleNearby && ai.splitCooldownTicks <= 0
+					&& bestPrey && bestPrey.r * 2 > leader.r) {
+					ai.target = bestPrey;
+					player.mouseX = bestPrey.x;
+					player.mouseY = bestPrey.y;
+					++player.splits;
+					ai.splitCooldownTicks = 25;
+				} else {
+					const d = Math.max(1, Math.hypot(mouseX, mouseY));
+					player.mouseX = leader.x + mouseX / d * cameraWidth;
+					player.mouseY = leader.y + mouseY / d * cameraHeight;
+				}
+			}
+
+			continue;
+		}
+
+		// leaderboard (must be recomputed for every player, because of "myPosition")
+		let o = 0;
+		if (now % 4 === 0) {
+			writer.writeUInt8(0x31, o++);
+			const length = Math.min(leaderboard.length, 10);
+			const myPosition = leaderboard.findIndex(entry => entry.player === player) || 0; // 0 if not found
+
+			(writer.writeUInt32LE(length, o), o += 4);
+			for (let i = 0; i < length; ++i) {
+				const { player: lbPlayer } = leaderboard[i];
+				(writer.writeUInt32LE(lbPlayer === player ? 1 : 0, o), o += 4);
+				(lbPlayer.name.copy(writer, o), o += lbPlayer.name.byteLength);
+				(writer.writeUInt32LE(myPosition + 1, o), o += 4);
+				(writer.writeUInt32LE(lbPlayer.sub ? 1 : 0, o), o += 4);
+			}
+
+			player.ws.send(writer.subarray(0, o));
+		}
 
 		// the new Set.prototype.difference and .intersection functions are only faster if the two sets are very
 		// disjoint, but usually they aren't (a player can't move that far between ticks)
 		// also, they were only added in node.js 22, which is quite recent, so better to stick with the old method
 		const oldVisibleCells = player.visibleCells;
+		player.visibleCells = visibleCells;
 		const newOwned = [];
 		const eat = [];
 		const add = [];
@@ -768,7 +1045,7 @@ const worldTick = () => {
 				if (cell.moved) upd.push(cell.encodingMove);
 			} else {
 				if (cell.owner === player) newOwned.push(cell.id);
-				add.push(cell.encodingFirst);
+				add.push(cell.encodingFirst); // TODO only do encodingMove
 			}
 		}
 		for (const cell of oldVisibleCells) {
@@ -780,16 +1057,24 @@ const worldTick = () => {
 		for (let i = 0; i < newOwned.length; ++i) {
 			writer.writeUInt8(0x20, 0);
 			writer.writeUInt32LE(newOwned[i], 1);
-			player.ws.send(writer.slice(0, 5));
+			player.ws.send(writer.subarray(0, 5));
 		}
 
-		let o = 0;
+		if (player.state === PLAYER_STATE_ROAM || player.state === PLAYER_STATE_SPECTATE) {
+			writer.writeUInt8(0x11, 0);
+			writer.writeFloatLE(player.camera.x, 1);
+			writer.writeFloatLE(player.camera.y, 5);
+			writer.writeFloatLE(player.camera.scale, 9);
+			player.ws.send(writer.subarray(0, 13));
+		}
+
+		o = 0;
 		writer.writeUInt8(0x10, o++); // packet: update
 
 		(writer.writeUInt16LE(eat.length, o), o += 2);
 		for (let i = 0, l = eat.length; i < l; ++i) {
-			(writer.writeUInt32LE(eat[i].id, o), o += 4);
 			(writer.writeUInt32LE(eat[i].deadTo, o), o += 4);
+			(writer.writeUInt32LE(eat[i].id, o), o += 4);
 		}
 
 		for (let i = 0, l = add.length; i < l; ++i) {
@@ -802,18 +1087,21 @@ const worldTick = () => {
 		}
 		(writer.writeUInt32LE(0, o), o += 4);
 
+		(writer.writeUInt16LE(del.length, o), o += 2);
 		for (let i = 0, l = del.length; i < l; ++i) {
 			(writer.writeUInt32LE(del[i].id, o), o += 4);
 		}
 
-		player.ws.send(writer.slice(0, o));
+		player.ws.send(writer.subarray(0, o));
 	}
 
 	// #3 update matchmaker
 	// #4 update gamemode-specific
 
+	const time = performance.now() - start;
+	tickTimes[now % 25] = { compileInteractionsTime, gameUpdateTime, updatePlayersTime, updateConnectionsTime: time };
 	++now;
-	setTimeout(worldTick, Math.max(performance.now() - start, 0));
+	setTimeout(worldTick, Math.max(40 - time, 0));
 };
 worldTick();
 
@@ -829,12 +1117,28 @@ for (let i = 0, o = SIG_VERSION_STRING.byteLength; i < 256; ++i, ++o) {
 
 const BORDER_UPDATE_PACKET = Buffer.alloc(33);
 BORDER_UPDATE_PACKET.writeUInt8(0x40, 0);
-BORDER_UPDATE_PACKET.writeDoubleLE(-settings.mapWidth, 1);
-BORDER_UPDATE_PACKET.writeDoubleLE(-settings.mapHeight, 9);
-BORDER_UPDATE_PACKET.writeDoubleLE(settings.mapWidth, 17);
-BORDER_UPDATE_PACKET.writeDoubleLE(settings.mapHeight, 25);
+BORDER_UPDATE_PACKET.writeDoubleLE(-settings.worldMapW, 1);
+BORDER_UPDATE_PACKET.writeDoubleLE(-settings.worldMapH, 9);
+BORDER_UPDATE_PACKET.writeDoubleLE(settings.worldMapW, 17);
+BORDER_UPDATE_PACKET.writeDoubleLE(settings.worldMapH, 25);
 
-const wss = new WebSocketServer({ noPort: true }); // TODO noPort, then implement /server/recaptcha/v3 and all that
+const SERVER_NAME = encodeUtf8('Server');
+const SPECTATOR_NAME = encodeUtf8('Spectator');
+// caching utf8 probably is not that necessary, but it's cool, so why not
+const serverMessageCache = [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15].map(x => undefined);
+const messagePacket = (flags, color, name, message) => {
+	let o = 0;
+	writer.writeUInt8(0x63, o++); // chat opcode
+	writer.writeUInt8(flags, o++);
+	(writer.writeUInt32LE(color, o), o += 3);
+	(name.copy(writer, o), o += name.byteLength);
+	(message.copy(writer, o), o += message.byteLength);
+	return writer.subarray(0, o);
+};
+
+let cliChatMuted = false;
+
+const wss = new WebSocketServer({ port: 80 }); // TODO noPort, then implement /server/recaptcha/v3 and all that
 wss.on('connection', client => {
 	let player;
 	setTimeout(() => {
@@ -852,11 +1156,12 @@ wss.on('connection', client => {
 		// data must always be a Buffer, even though ws module is very ambiguous
 		if (buf.byteLength >= 512 || !buf.byteLength) return client.close(1009, 'Unexpected message size');
 		if (!player) {
-			if (!data.equals(SIG_VERSION_STRING)) client.close(1003, 'Ambiguous protocol');
+			if (!buf.equals(SIG_VERSION_STRING)) client.close(1003, 'Ambiguous protocol');
 
 			player = {
 				bot: false,
 				camera: { x: 0, y: 0, scale: 1 },
+				chatAt: now,
 				clan: EMPTY_STRING,
 				disconnectedAt: 0,
 				minionCommander: undefined,
@@ -865,6 +1170,7 @@ wss.on('connection', client => {
 				name: EMPTY_STRING,
 				owned: new Set(),
 				q: false,
+				rgb: 0x7f7f7f,
 				showClanmates: false,
 				skin: EMPTY_STRING,
 				spawn: undefined,
@@ -888,16 +1194,8 @@ wss.on('connection', client => {
 		let o = 0;
 		const readUtf8 = () => { // null-terminated utf8 string
 			let start = o;
-			while (o < buf.byteLength && !buf.readUInt8(o)) ++o;
-			return buf.slice(start, o).toString('utf8');
-		};
-		const encodeUtf8 = s => {
-			const base = s.toString('utf-8');
-			const out = Buffer.alloc(base.byteLength + 1); // null-terminated
-			for (let o = 0; o < base.byteLength; ++o) {
-				out[o] = base[o] || 0xff; // get rid of null terminators
-			}
-			return out;
+			while (o < buf.byteLength && buf.readUInt8(o)) ++o;
+			return buf.subarray(start, o).toString('utf8');
 		};
 		const opcode = buf.readUInt8(o++);
 		if (opcode === 0) {
@@ -920,11 +1218,11 @@ wss.on('connection', client => {
 
 			player.spawn = {
 				name: encodeUtf8(body.name.substring(0, 64)),
-				skin: encodeUtf8(body.skin.substring(0, 20)), // low limit, to prevent accessing things that aren't skins
+				skin: encodeUtf8((body.skin || '').substring(0, 20)), // low limit, to prevent accessing things that aren't skins
 				spectating,
 				sub: !!body.sub,
 			};
-			player.clan = encodeUtf8(body.clan.substring(0, 32));
+			player.clan = encodeUtf8((body.clan || '').substring(0, 32));
 			player.showClanmates = !!body.showClanmates;
 		} else if (opcode === 0x10) {
 			if (buf.byteLength === 13) {
@@ -937,19 +1235,227 @@ wss.on('connection', client => {
 				player.mouseX = ~~buf.readDoubleLE(o);
 				player.mouseY = ~~buf.readDoubleLE(o + 8);
 			} else client.close(1003, 'Unexpected message format');
-		} else if (opcode === 0x17) ++player.splits;
-		else if (opcode === 0x18) player.q = true;
-		else if (opcode === 0x19) player.q = false;
-		else if (opcode === 0x21) player.w = true;
-		else if (opcode === 0x99) {
+		} else if (opcode === 0x11) ++player.splits;
+		else if (opcode === 0x12) player.q = true;
+		else if (opcode === 0x13) player.q = false;
+		else if (opcode === 0x15) player.w = true;
+		else if (opcode === 0x63) {
 			if (buf.byteLength < 2) return client.close(1003, 'Bad message format');
 			++o; // skip flags altogether
-			const message = readUtf8();
+			const message = readUtf8().trim();
+			console.log('chat:', message);
 			// TODO chat message, filtering and all that
+			// DO THIS TOMORROW, then leaderboard, then border collisions, then viruses
+			// and i think that's it maybe
+			if (message[0] === '/' && message.length >= 2) {
+				let [command, ...args] = message.split(' ');
+				command = command.toLowerCase();
+				const serverMessage = (cacheId, msg) => {
+					client.send(messagePacket(0x80, 0xc03f3f, SERVER_NAME, serverMessageCache[cacheId] ??= encodeUtf8(msg)));
+				}
+				if (command === '/help') {
+					serverMessage(0, 'available commands:');
+					serverMessage(1, 'id - get your id');
+					serverMessage(2, 'worldid - get your world\'s id');
+					serverMessage(3, 'leaveworld - leave your world');
+					serverMessage(4, 'joinworld <id> - try to join a world');
+				} else if (command === '/id') {
+					serverMessage(5, 'your ID is 0');
+				} else if (command === '/worldid') {
+					if (player.state === PLAYER_STATE_LIMBO) serverMessage(6, 'you\'re not in a world');
+					else serverMessage(7, 'your world ID is 1');
+				} else if (command === '/leaveworld') {
+					if (player.state === PLAYER_STATE_LIMBO) return serverMessage(8, 'you\'re not in a world');
+
+					let score = 0;
+					for (const cell of player.owned) {
+						score += cell.r * cell.r / 100;
+					}
+					if (score >= 5500) return serverMessage(9, 'you have >5500 score');
+
+					player.state = PLAYER_STATE_LIMBO;
+					for (const cell of player.owned) {
+						cell.dead = true;
+						bitgridRemove(cell);
+					}
+					player.owned.clear();
+					
+					let j = 0;
+					for (let i = 0, l = playerCells.length; i < l; ++i) {
+						playerCells[j] = playerCells[i];
+						if (playerCells[i].owner !== player) ++j;
+					}
+					playerCells.length = j;
+
+					j = 0;
+					for (let i = 0, l = boostingCells.length; i < l; ++i) {
+						boostingCells[j] = boostingCells[i];
+						if (boostingCells[i].owner !== player) ++j;
+					}
+					boostingCells.length = j;
+
+					client.send(Buffer.from([0x12])); // world reset
+				} else if (command === '/joinworld') {
+					// just assume the argument is 1
+					if (player.state !== PLAYER_STATE_LIMBO) return serverMessage(10, 'you\'re already in a world');
+					player.state = PLAYER_STATE_IDLE;
+				} else {
+					serverMessage(11, 'unknown command, execute /help for the list of commands');
+				}
+
+				return;
+			}
+
+			if (now - player.chatAt < 5) return; // no cooldown on commands (respawns), but slow down chats
+			const trimmed = message.substring(0, 32);
+			const packet = messagePacket(
+				0,
+				player.rgb,
+				player.name === EMPTY_STRING ? SPECTATOR_NAME : player.name,
+				encodeUtf8(trimmed),
+			);
+			for (const otherPlayer of players) {
+				if (otherPlayer.bot || otherPlayer.minionCommander) continue;
+				if (otherPlayer.state !== PLAYER_STATE_LIMBO && otherPlayer.ws.readyState === 1)
+					otherPlayer.ws.send(packet);
+			}
+			if (!cliChatMuted) console.log(`  [${player.name}] ${trimmed}`);
 		} else if (opcode === 0xfe) {
 			// stats
-			if (player.limbo) return;
+			if (player.state === PLAYER_STATE_LIMBO) return;
 			client.send(statsBuffer);
 		}
 	});
 });
+
+console.log(`server started in ${(performance.now() - serverStartTime).toFixed(1)}ms`);
+
+const commandStream = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+    terminal: true,
+    prompt: "",
+    historySize: 64,
+    removeHistoryDuplicates: true
+});
+
+const ask = input => {
+	input = input.trim();
+	if (input) {
+		const args = input.split(' ');
+		const command = args.shift().toLowerCase();
+		if (command === 'help') {
+			console.log('help - show this help screen');
+			console.log('mute - stop showing chat on the command line');
+			console.log('players - shows a list of all real player and their names');
+			console.log('setting <name> <value> - changes a setting to a different value, or shows the current value');
+			console.log('snapshot - dumps a memory snapshot, this can take several seconds');
+			console.log('stats - show server uptime, load, memory usage, and player counts');
+			console.log('unmute - start showing chats again on the command line');
+		} else if (command === 'mute') {
+			cliChatMuted = true;
+			console.log('chat now muted on the cli');
+		} else if (command === 'players') {
+			for (const player of players) {
+				if (player.bot || player.minionCommander) continue;
+
+				let stateName;
+				if (player.state === PLAYER_STATE_IDLE) stateName = '----';
+				else if (player.state === PLAYER_STATE_PLAYING) stateName = 'play';
+				else if (player.sate === PLAYER_STATE_ROAM) stateName = 'roam';
+				else if (player.state === PLAYER_STATE_SPECTATE) stateName = 'spec';
+				else stateName = 'xxxx';
+
+				let mass = 0;
+				for (const cell of player.owned) {
+					mass += cell.r * cell.r / 100;
+				}
+
+				console.log(`- ${stateName} - ${~~mass} mass - ${player.name}`);
+			}
+		} else if (command === 'say') {
+			// no sever flag, otherwise it gets duplicated between sigfixes tabs
+			const packet = messagePacket(0, 0xc03f3f, SERVER_NAME, encodeUtf8(args.join(' ')));
+			for (const player of players) {
+				if (player.bot || player.minionCommander) continue;
+				if (player.state !== PLAYER_STATE_LIMBO && player.ws.readyState === 1) player.ws.send(packet);
+			}
+		} else if (command === 'setting') {
+			if (args[0] in settings) {
+				if (args[1]) {
+					if (typeof settings[args[0]] !== 'number') console.log('setting is not a number');
+					else {
+						const numeric = Number(args[1]);
+						if (Number.isNaN(numeric)) console.log('argument not a number');
+						else {
+							const old = settings[args[0]];
+							settings[args[0]] = numeric;
+							console.log(`${args[0]} : ${old} -> ${numeric}`);
+						}
+					}
+				} else {
+					console.log(`${args[0]} : ${settings[args[0]]}`);
+				}
+			}
+		} else if (command === 'snapshot') {
+			const start = performance.now();
+			const path = require('v8').writeHeapSnapshot();
+			console.log(`written in ${(performance.now() - start).toFixed(2)} ms to ${path}`);
+		} else if (command === 'stats') {
+			// { compileInteractionsTime, gameUpdateTime, updatePlayersTime, updateConnectionsTime: time };
+			let avgCompileInteractionsTime = 0;
+			let avgGameUpdateTime = 0;
+			let avgUpdatePlayersTime = 0;
+			let avgUpdateConnectionsTime = 0;
+			for (const frame of tickTimes) {
+				avgCompileInteractionsTime += frame.compileInteractionsTime;
+				avgGameUpdateTime += frame.gameUpdateTime;
+				avgUpdatePlayersTime += frame.updatePlayersTime;
+				avgUpdateConnectionsTime += frame.updateConnectionsTime;
+			}
+			const avgTickTime = avgCompileInteractionsTime + avgGameUpdateTime + avgUpdatePlayersTime + avgUpdateConnectionsTime;
+			console.log(`load:   ${(avgTickTime / 25).toFixed(2)} ms / 40 ms`);
+			console.log(`        ${(avgCompileInteractionsTime / 25).toFixed(2)} ms -> ${(avgGameUpdateTime / 25).toFixed(2)} ms -> ${(avgUpdatePlayersTime / 25).toFixed(2)} ms -> ${(avgUpdateConnectionsTime / 25).toFixed(2)} ms`);
+
+			const memory = process.memoryUsage();
+			const pretty = value => {
+				const units = ["B", "kiB", "MiB", "GiB", "TiB"]; let i = 0;
+			    for (; i < units.length && value / 1024 > 1; i++)
+			        value /= 1024;
+			    return `${value.toFixed(1)} ${units[i]}`;
+			};
+			console.log(`memory: ${pretty(memory.heapUsed)} / ${pretty(memory.heapTotal)} / ${pretty(memory.rss)} / ${pretty(memory.external)}`);
+
+			const uptimeValue = (performance.now() - serverStartTime) / 1000;
+			let uptime = `${~~(uptimeValue % 60)}s`;
+			if (uptimeValue >= 60) uptime = `${~~(uptimeValue / 60 % 60)}m ${uptime}`;
+			if (uptimeValue >= 3600) uptime = `${~~(uptimeValue / 3600 % 24)}h ${uptime}`;
+			if (uptimeValue >= 86400) uptime = `${~~(uptimeValue / 86400)}d ${uptime}`;
+			console.log(`uptime: ${uptime}`);
+
+			let realPellets = 0, realViruses = 0, realEjects = 0, realPlayerCells = 0, realCells = 0;
+			let playing = 0, spectating = 0, idle = 0, minions = 0, bots = 0;
+			bitgridSearch(0, 31, 0, 31, cell => {
+				++realCells;
+				if (cell.type === CELL_TYPE_PELLET) ++realPellets;
+				else if (cell.type === CELL_TYPE_PLAYER) ++realPlayerCells;
+				else if (cell.type === CELL_TYPE_EJECT) ++realEjects;
+				else if (cell.type === CELL_TYPE_VIRUS) ++realViruses;
+			});
+			for (const player of players) {
+				if (player.minionCommander) ++minions;
+				else if (player.bot) ++bots;
+				else if (player.state === PLAYER_STATE_ROAM || player.state === PLAYER_STATE_SPECTATE) ++spectating;
+				else if (player.state === PLAYER_STATE_PLAYING) ++playing;
+				else ++idle;
+			}
+			console.log(`${realCells} cells - ${realPlayerCells} player cells, ${realPellets} pellets, ${realEjects} ejects, ${realViruses} viruses`);
+			console.log(`${playing} playing - ${spectating} spectating - ${idle} idle - ${minions} minions - ${bots} bots`);
+		} else if (command === 'unmute') {
+			cliChatMuted = false;
+			console.log('chat now unmuted on the cli');
+		}
+	}
+	commandStream.question('@ ', ask);
+};
+commandStream.question('@ ', ask);
