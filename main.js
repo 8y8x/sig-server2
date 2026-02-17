@@ -1035,8 +1035,6 @@ const worldTick = () => {
 			else del.push(cell); // sigmally: non-sigmally clients require the cell to be in both eat and del
 		}
 
-		console.log('add:', add.length, 'upd:', upd.length);
-
 		for (let i = 0; i < newOwned.length; ++i) {
 			writer.writeUInt8(0x20, 0);
 			writer.writeUInt32LE(newOwned[i], 1);
