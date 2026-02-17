@@ -596,7 +596,12 @@ const worldTick = () => {
 				}
 				playerCells.length = j;
 				players.delete(player);
-			} else if (player.state !== PLAYER_STATE_PLAYING) players.delete(player);
+				player.owned.clear();
+				player.state = PLAYER_STATE_IDLE;
+			} else if (player.state !== PLAYER_STATE_PLAYING) {
+				players.delete(player);
+				player.state = PLAYER_STATE_IDLE;
+			}
 		} else {
 			// split
 			for (let i = 0; i < player.splits; ++i) {
@@ -720,10 +725,12 @@ const worldTick = () => {
 	let playingExternal = 0;
 	let playingInternal = 0;
 	let spectating = 0;
+	let idling = 0;
 	for (const player of players) {
 		if (player.minionCommander || player.bot) ++playingInternal;
 		else if (player.state === PLAYER_STATE_PLAYING) ++playingExternal;
 		else if (player.state === PLAYER_STATE_ROAM || player.state === PLAYER_STATE_SPECTATE) ++spectating;
+		else ++idling;
 	}
 
 	// now, update minions
@@ -820,7 +827,7 @@ const worldTick = () => {
 	statsBuffer = Buffer.concat([Buffer.from([0xfe]), Buffer.from(JSON.stringify({
 		limit: settings.listenerMaxConnections,
 		internal: playingInternal, // might be outdated by one tick, but that's okay
-		external: playingExternal + spectating,
+		external: playingExternal + spectating + idling,
 		playing: playingExternal,
 		spectating,
 		name: settings.serverName,
