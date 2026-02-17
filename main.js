@@ -408,7 +408,9 @@ const worldTick = () => {
 		bitgridUpdate(cell);
 	}
 
-	for (let i = 0, l = playerCells.length; i < l; ++i) {
+	// OgarII uses playerCells.unshift() for insertions and iterates 0 -> len.
+	// but it's much faster to keep the list reversed, use playerCells.push() for insertions, and iterate len -> 0.
+	for (let i = playerCells.length - 1; i >= 0; --i) {
 		const cell = playerCells[i];
 		bitgridSearch(cell.bgXmin, cell.bgXmax, cell.bgYmin, cell.bgYmax, otherCell => {
 			if (cell === otherCell) return;
