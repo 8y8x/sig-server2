@@ -1450,3 +1450,36 @@ const ask = input => {
 	commandStream.question('@ ', ask);
 };
 commandStream.question('@ ', ask);
+
+const log = fs.createWriteStream(`log-${new Date().toISOString()}.txt`);
+setInterval(() => {
+	let avg1 = 0;
+	let avg2 = 0;
+	let avg3 = 0;
+	let avg4 = 0;
+	let avgTickTime = 0;
+	for (const frame of tickTimes) {
+		avg1 += frame.compileInteractionsTime;
+		avg2 += frame.gameUpdateTime;
+		avg3 += frame.updatePlayersTime;
+		avg4 += frame.updateConnectionsTime;
+		avgTickTime += frame.time;
+	}
+	let realPellets = 0, realViruses = 0, realEjects = 0, realPlayerCells = 0, realCells = 0;
+	let playing = 0, spectating = 0, idle = 0, minions = 0, bots = 0;
+	bitgridSearch(0, 31, 0, 31, cell => {
+		++realCells;
+		if (cell.type === CELL_TYPE_PELLET) ++realPellets;
+		else if (cell.type === CELL_TYPE_PLAYER) ++realPlayerCells;
+		else if (cell.type === CELL_TYPE_EJECT) ++realEjects;
+		else if (cell.type === CELL_TYPE_VIRUS) ++realViruses;
+	});
+	for (const player of players) {
+		if (player.minionCommander) ++minions;
+		else if (player.bot) ++bots;
+		else if (player.state === PLAYER_STATE_ROAM || player.state === PLAYER_STATE_SPECTATE) ++spectating;
+		else if (player.state === PLAYER_STATE_PLAYING) ++playing;
+		else ++idle;
+	}
+	log.write(`${new Date().toISOString()} | ${(avg1 / tickTimes.length).toFixed(2)} -> ${(avg2 / tickTimes.length).toFixed(2)} -> ${(avg3 / tickTimes.length).toFixed(2)} -> ${(avg4 / tickTimes.length).toFixed(2)} (${(avgTickTime / tickTimes.length * 2.5).toFixed(1)}% load) | ${playing} playing, ${spectating} spectating, ${idle} idle, ${minions} minions, ${bots} bots | ${realPellets}(${pellets}) pellets, ${realViruses}(${viruses}), ${realEjects} ejects, ${realPlayerCells} player cells, ${realCells} total cells\n`);
+}, 15_000);
