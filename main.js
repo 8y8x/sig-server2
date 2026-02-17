@@ -317,7 +317,6 @@ const worldTick = () => {
 		bitgridSearch(0, 31, 0, 31, cell => {
 			if (cell.type === CELL_TYPE_PELLET && ++i % fraction >= 1) removalQueue.push(cell);
 		});
-		console.log('BLEEP', removalQueue.length);
 		for (const pellet of removalQueue) bitgridRemove(pellet);
 		pellets -= removalQueue.length;
 	}
@@ -655,6 +654,7 @@ const worldTick = () => {
 					boostingCells.push(eject);
 
 					cell.r = Math.sqrt(cell.r * cell.r - settings.ejectingLoss * settings.ejectingLoss);
+					cell.moved = now;
 					encode(cell);
 					bitgridUpdate(cell);
 				}
@@ -1023,7 +1023,7 @@ const worldTick = () => {
 		const del = [];
 		for (const cell of visibleCells) {
 			if (oldVisibleCells.has(cell)) {
-				if (cell.moved) upd.push(cell.encodingMove);
+				if (cell.moved === now) upd.push(cell.encodingMove);
 			} else {
 				if (cell.owner === player) newOwned.push(cell.id);
 				add.push(cell.encodingFirst); // TODO only do encodingMove
@@ -1034,6 +1034,8 @@ const worldTick = () => {
 			if (cell.deadTo) eat.push(cell);
 			else del.push(cell); // sigmally: non-sigmally clients require the cell to be in both eat and del
 		}
+
+		console.log('add:', add.length, 'upd:', upd.length);
 
 		for (let i = 0; i < newOwned.length; ++i) {
 			writer.writeUInt8(0x20, 0);
