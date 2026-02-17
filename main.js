@@ -24,7 +24,7 @@ const encodeUtf8 = s => {
 
 // undefined behaviour occurs if a cell ever exists beyond the bitgrid, just keep it in mind
 // (the width and height) get all messed up
-const BITGRID_TILE_SIZE = Math.max(1250, (settings.worldMapW * 2 + 3000) / 32);
+const BITGRID_TILE_SIZE = Math.max(2500, (settings.worldMapW * 2 + 3000) / 32);
 const bitgridTiles = [];
 for (let i = 0; i < 1024; ++i) bitgridTiles.push(new Set());
 
@@ -102,6 +102,7 @@ const PLAYER_OWNER_SERVER = {
 	camera: { x: 0, y: 0, scale: 1 },
 	clan: EMPTY_STRING,
 	disconnectedAt: 0,
+	lastW: 0,
 	minionCommander: undefined,
 	mouseX: 0,
 	mouseY: 0,
@@ -125,6 +126,7 @@ const PLAYER_BOT_SKINS = settings.worldPlayerBotSkins.map(encodeUtf8);
 
 const SQRT2 = Math.sqrt(2);
 const WORLD_EAT_MULT = Math.sqrt(1.3); // must be 30% bigger in mass to eat a cell
+const WORLD_EAT_OVERLAP_MULT = 1 / 3;
 
 const tickTimes = [];
 
@@ -198,7 +200,7 @@ const leftEatsRight = (leftCell, rightCell) => {
 		// players eat everything, but minions only eat minions
 		if (leftCell.owner.minionCommander && !rightCell.owner.minionCommander) return false;
 		if (leftCell.owner === rightCell.owner) return leftCell.mergeable && rightCell.mergeable
-			&& Math.hypot(leftCell.x - rightCell.x, leftCell.y - rightCell.y) <= leftCell.r - rightCell.r / settings.worldEatOverlapDiv;
+			&& Math.hypot(leftCell.x - rightCell.x, leftCell.y - rightCell.y) <= leftCell.r - rightCell.r * WORLD_EAT_OVERLAP_MULT;
 	} else if (leftCell.type === CELL_TYPE_PELLET) {
 		// pellets don't eat anything
 		return false;
@@ -211,7 +213,7 @@ const leftEatsRight = (leftCell, rightCell) => {
 	}
 
 	return leftCell.r > rightCell.r * WORLD_EAT_MULT
-		&& Math.hypot(leftCell.x - rightCell.x, leftCell.y - rightCell.y) <= leftCell.r - rightCell.r / settings.worldEatOverlapDiv;
+		&& Math.hypot(leftCell.x - rightCell.x, leftCell.y - rightCell.y) <= leftCell.r - rightCell.r * WORLD_EAT_OVERLAP_MULT;
 };
 const leftCollidesRight = (leftCell, rightCell) => {
 	if (leftCell.type === CELL_TYPE_EJECT && rightCell.type === CELL_TYPE_EJECT) return true;
@@ -293,31 +295,6 @@ const encode = cell => {
 
 const MINION_SPAWN = { name: encodeUtf8(settings.minionName), skin: EMPTY_STRING, spectating: false, sub: false };
 
-for (let i = 0; i < settings.worldPlayerBotsPerWorld; ++i) {
-	players.add({
-		bot: true,
-		camera: { x: 0, y: 0, scale: 1 },
-		clan: EMPTY_STRING,
-		disconnectedAt: 0,
-		minionCommander: undefined,
-		mouseX: 0,
-		mouseY: 0,
-		name: EMPTY_STRING,
-		owned: new Set(),
-		rgb: 0x7f7f7f,
-		q: false,
-		showClanmates: false,
-		skin: EMPTY_STRING,
-		spawn: undefined,
-		splits: 0,
-		state: PLAYER_STATE_IDLE,
-		sub: false,
-		updated: now,
-		visibleCells: new Set(),
-		w: false,
-	});
-}
-
 const worldEatArray = [];
 const worldRigidArray = [];
 const worldTick = () => {
@@ -330,6 +307,19 @@ const worldTick = () => {
 	for (; pellets < settings.pelletCount; ++pellets) {
 		const [x, y] = safeSpawnPos(settings.pelletMinSize); // TODO, this should probably not be safeSpawnPos
 		add({ type: CELL_TYPE_PELLET, x, y, r: settings.pelletMinSize, rgb: randomColors[~~(Math.random() * 1536)] });
+	}
+
+	if (pellets > settings.pelletCount) {
+		// only happens very rarely
+		const fraction = pellets / settings.pelletCount;
+		let i = 0;
+		const removalQueue = [];
+		bitgridSearch(0, 31, 0, 31, cell => {
+			if (cell.type === CELL_TYPE_PELLET && ++i % fraction >= 1) removalQueue.push(cell);
+		});
+		console.log('BLEEP', removalQueue.length);
+		for (const pellet of removalQueue) bitgridRemove(pellet);
+		pellets -= removalQueue.length;
 	}
 
 	for (; viruses < settings.virusMinCount; ++viruses) {
@@ -640,7 +630,7 @@ const worldTick = () => {
 			player.splits = 0;
 
 			// eject
-			if (player.w) {
+			if (player.w && now - player.lastW >= settings.playerEjectDelay) {
 				for (const cell of player.owned) {
 					if (cell.r < settings.playerMinEjectSize) continue;
 					let dx = player.mouseX - cell.x;
@@ -661,6 +651,7 @@ const worldTick = () => {
 					encode(cell);
 					bitgridUpdate(cell);
 				}
+				player.lastW = now;
 				player.w = false;
 			}
 
@@ -767,6 +758,7 @@ const worldTick = () => {
 				camera: { x: 0, y: 0, scale: 1 },
 				clan: EMPTY_STRING,
 				disconnectedAt: 0,
+				lastW: 0,
 				minionCommander: player,
 				mouseX: 0,
 				mouseY: 0,
@@ -787,8 +779,44 @@ const worldTick = () => {
 		}
 	}
 
+	// add/remove extra player bots
+	let playerBots = 0;
+	for (const player of players) {
+		if (player.bot) {
+			if (playerBots > settings.worldPlayerBotsPerWorld) player.disconnectedAt = -Infinity;
+			else ++playerBots;
+		}
+	}
+
+	for (; playerBots < settings.worldPlayerBotsPerWorld; ++playerBots) {
+		players.add({
+			bot: true,
+			camera: { x: 0, y: 0, scale: 1 },
+			clan: EMPTY_STRING,
+			disconnectedAt: 0,
+			minionCommander: undefined,
+			mouseX: 0,
+			mouseY: 0,
+			lastW: 0,
+			name: EMPTY_STRING,
+			owned: new Set(),
+			rgb: 0x7f7f7f,
+			q: false,
+			showClanmates: false,
+			skin: EMPTY_STRING,
+			spawn: undefined,
+			splits: 0,
+			state: PLAYER_STATE_IDLE,
+			sub: false,
+			updated: now,
+			visibleCells: new Set(),
+			w: false,
+		});
+	}
+
 	// compile statistics
-	const loadTime = performance.now() - start;
+	let avgTickTime = 0;
+	for (const frame of tickTimes) avgTickTime += frame.time;
 	statsBuffer = Buffer.concat([Buffer.from([0xfe]), Buffer.from(JSON.stringify({
 		limit: settings.listenerMaxConnections,
 		internal: playingInternal, // might be outdated by one tick, but that's okay
@@ -797,11 +825,11 @@ const worldTick = () => {
 		spectating,
 		name: settings.serverName,
 		gamemode: settings.serverGamemode,
-		loadTime: tickTimes[(now - 1 + 25) % 25]?.time ?? 0,
+		loadTime: avgTickTime / tickTimes.length,
 		uptime: ~~((performance.now() - serverStartTime) / 1000),
 		// legacy
 		mode: settings.serverGamemode,
-		update: loadTime,
+		update: avgTickTime / tickTimes.length,
 		playersTotal: playingExternal + spectating,
 		playersAlive: playingExternal,
 		playersSpect: spectating,
@@ -912,7 +940,7 @@ const worldTick = () => {
 				} else {
 					const truncatedInfluence = Math.log10(cell.r * cell.r);
 					const canSplitKill = leader.r / SQRT2 > cell.r * WORLD_EAT_MULT
-						&& d - splitDistance <= leader.r - cell.r / settings.worldEatOverlapDiv;
+						&& d - splitDistance <= leader.r - cell.r * WORLD_EAT_OVERLAP_MULT;
 					const canEat = leader.r >= cell.r * WORLD_EAT_MULT;
 					if (cell.type === CELL_TYPE_PLAYER) {
 						if (cell.owner !== player) {
@@ -1114,6 +1142,7 @@ wss.on('connection', client => {
 				chatAt: now,
 				clan: EMPTY_STRING,
 				disconnectedAt: 0,
+				lastW: 0,
 				minionCommander: undefined,
 				mouseX: 0,
 				mouseY: 0,
@@ -1291,7 +1320,10 @@ const ask = input => {
 	if (input) {
 		const args = input.split(' ');
 		const command = args.shift().toLowerCase();
-		if (command === 'help') {
+		if (command === 'exit') {
+			process.exit(0);
+		} else if (command === 'help') {
+			console.log('exit - calls process.exit(0)');
 			console.log('help - show this help screen');
 			console.log('mute - stop showing chat on the command line');
 			console.log('players - shows a list of all real player and their names');
@@ -1397,7 +1429,7 @@ const ask = input => {
 				else if (player.state === PLAYER_STATE_PLAYING) ++playing;
 				else ++idle;
 			}
-			console.log(`${realCells} cells - ${realPlayerCells} player cells, ${realPellets} pellets, ${realEjects} ejects, ${realViruses} viruses`);
+			console.log(`${realCells} cells - ${realPlayerCells} player cells, ${realPellets}(${pellets}) pellets, ${realEjects} ejects, ${realViruses}(${viruses}) viruses`);
 			console.log(`${playing} playing - ${spectating} spectating - ${idle} idle - ${minions} minions - ${bots} bots`);
 		} else if (command === 'unmute') {
 			cliChatMuted = false;
