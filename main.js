@@ -82,7 +82,8 @@ const bitgridSearch = (xmin, xmax, ymin, ymax, cb) => {
 	for (let x = xmin; x <= xmax; ++x) {
 		for (let y = ymin; y <= ymax; ++y) {
 			for (const cell of bitgridTiles[y * 32 + x]) {
-				if ((xmin <= cell.bgXmin && cell.bgXmin < x) || (ymin <= cell.bgYmin && cell.bgYmin < y)) continue; // no duplicates
+				// no duplicates
+				if ((xmin <= cell.bgXmin && cell.bgXmin < x) || (ymin <= cell.bgYmin && cell.bgYmin < y)) continue;
 				if (cb(cell)) return true;
 			}
 		}
@@ -121,6 +122,9 @@ const PLAYER_OWNER_SERVER = {
 }
 const PLAYER_BOT_NAMES = settings.worldPlayerBotNames.map(x => encodeUtf8(x.replace('{*}', '')));
 const PLAYER_BOT_SKINS = settings.worldPlayerBotSkins.map(encodeUtf8);
+
+const SQRT2 = Math.sqrt(2);
+const WORLD_EAT_MULT = Math.sqrt(1.3); // must be 30% bigger in mass to eat a cell
 
 const tickTimes = [];
 
@@ -162,31 +166,22 @@ const bounce = (cell, fromBoost) => {
 	}
 };
 
-const launch = (cell, radius, boostUnitX, boostUnitY, boostMagnitude) => {
-	const newCell = {
-		type: CELL_TYPE_PLAYER,
+const add = cellSkeleton => {
+	const cell = {
+		type: CELL_TYPE_EJECT,
 		id: nextCellId++,
-		x: cell.x + settings.playerSplitDistance * boostUnitX,
-		y: cell.y + settings.playerSplitDistance * boostUnitY,
-		r: radius,
-		rgb: cell.rgb,
-		born: now,
-		moved: now,
-		dead: false,
-		deadTo: 0,
-		owner: cell.owner,
-		boostUnitX,
-		boostUnitY,
-		boostMagnitude,
-		encodingMove: EMPTY_BUFFER,
-		encodingFirst: EMPTY_BUFFER,
-		mergeable: false,
+		x: 0, y: 0, r: 100,
+		rgb: 0x7f7f7f,
+		born: now, moved: now, dead: false, deadTo: 0,
+		owner: PLAYER_OWNER_SERVER,
+		boostUnitX: 0, boostUnitY: 0, boostMagnitude: 0,
+		encodingMove: EMPTY_BUFFER, encodingFirst: EMPTY_BUFFER,
+		mergeable: false, fed: 0,
+		...cellSkeleton,
 	};
-	encode(newCell);
-	bitgridAdd(newCell);
-	cell.owner.owned.add(newCell);
-	boostingCells.push(newCell);
-	playerCells.push(newCell);
+	encode(cell);
+	bitgridAdd(cell);
+	return cell;
 };
 
 const remove = cell => {
@@ -202,7 +197,8 @@ const leftEatsRight = (leftCell, rightCell) => {
 	if (leftCell.type === CELL_TYPE_PLAYER) {
 		// players eat everything, but minions only eat minions
 		if (leftCell.owner.minionCommander && !rightCell.owner.minionCommander) return false;
-		if (leftCell.owner === rightCell.owner && (!leftCell.mergeable || !rightCell.mergeable)) return false;
+		if (leftCell.owner === rightCell.owner) return leftCell.mergeable && rightCell.mergeable
+			&& Math.hypot(leftCell.x - rightCell.x, leftCell.y - rightCell.y) <= leftCell.r - rightCell.r / settings.worldEatOverlapDiv;
 	} else if (leftCell.type === CELL_TYPE_PELLET) {
 		// pellets don't eat anything
 		return false;
@@ -214,7 +210,7 @@ const leftEatsRight = (leftCell, rightCell) => {
 		return false;
 	}
 
-	return leftCell.r > rightCell.r * settings.worldEatMult
+	return leftCell.r > rightCell.r * WORLD_EAT_MULT
 		&& Math.hypot(leftCell.x - rightCell.x, leftCell.y - rightCell.y) <= leftCell.r - rightCell.r / settings.worldEatOverlapDiv;
 };
 const leftCollidesRight = (leftCell, rightCell) => {
@@ -295,7 +291,7 @@ const encode = cell => {
 	cell.encodingFirst = first;
 };
 
-const MINION_SPAWN = { name: encodeUtf8(' '), skin: EMPTY_STRING, spectating: false, sub: false };
+const MINION_SPAWN = { name: encodeUtf8(settings.minionName), skin: EMPTY_STRING, spectating: false, sub: false };
 
 for (let i = 0; i < settings.worldPlayerBotsPerWorld; ++i) {
 	players.add({
@@ -316,6 +312,7 @@ for (let i = 0; i < settings.worldPlayerBotsPerWorld; ++i) {
 		splits: 0,
 		state: PLAYER_STATE_IDLE,
 		sub: false,
+		updated: now,
 		visibleCells: new Set(),
 		w: false,
 	});
@@ -332,54 +329,12 @@ const worldTick = () => {
 
 	for (; pellets < settings.pelletCount; ++pellets) {
 		const [x, y] = safeSpawnPos(settings.pelletMinSize); // TODO, this should probably not be safeSpawnPos
-		const pellet = {
-			type: CELL_TYPE_PELLET,
-			id: nextCellId++,
-			x,
-			y,
-			r: settings.pelletMinSize,
-			rgb: randomColors[~~(Math.random() * 256 * 6)],
-			born: now,
-			moved: now,
-			dead: false,
-			deadTo: 0,
-			owner: PLAYER_OWNER_SERVER,
-			boostUnitX: 0,
-			boostUnitY: 0,
-			boostMagnitude: 0,
-			encodingMove: EMPTY_BUFFER,
-			encodingFirst: EMPTY_BUFFER,
-			mergeable: false,
-			fed: 0,
-		};
-		encode(pellet);
-		bitgridAdd(pellet);
+		add({ type: CELL_TYPE_PELLET, x, y, r: settings.pelletMinSize, rgb: randomColors[~~(Math.random() * 1536)] });
 	}
 
 	for (; viruses < settings.virusMinCount; ++viruses) {
 		const [x, y] = safeSpawnPos(settings.virusSize);
-		const virus = {
-			type: CELL_TYPE_VIRUS,
-			id: nextCellId++,
-			x,
-			y,
-			r: settings.virusSize,
-			rgb: 0x33ff33,
-			born: now,
-			moved: now,
-			dead: false,
-			deadTo: 0,
-			owner: PLAYER_OWNER_SERVER,
-			boostUnitX: 0,
-			boostUnitY: 0,
-			boostMagnitude: 0,
-			encodingMove: EMPTY_BUFFER,
-			encodingFirst: EMPTY_BUFFER,
-			mergeable: false,
-			fed: 0,
-		};
-		encode(virus);
-		bitgridAdd(virus);
+		add({ type: CELL_TYPE_VIRUS, x, y, r: settings.virusSize, rgb: 0x33ff33 });
 	}
 
 	for (let i = 0, l = boostingCells.length; i < l; ++i) {
@@ -441,7 +396,18 @@ const worldTick = () => {
 			const splitSize = Math.min(Math.sqrt(cell.r * cell.r / splitCellCount), settings.playerMaxSize);
 			for (let i = 1; i < splitCellCount; ++i) {
 				const angle = Math.random() * 2 * Math.PI;
-				launch(cell, splitSize, Math.cos(angle), Math.sin(angle), settings.playerSplitBoost);
+				const boostUnitX = Math.cos(angle);
+				const boostUnitY = Math.sin(angle);
+				const newCell = add({
+					type: CELL_TYPE_PLAYER,
+					x: cell.x + settings.playerSplitDistance * boostUnitX,
+					y: cell.y + settings.playerSplitDistance * boostUnitY,
+					r: splitSize, rgb: cell.rgb, owner: cell.owner,
+					boostUnitX, boostUnitY, boostMagnitude: settings.playerSplitBoost,
+				});
+				cell.owner.owned.add(newCell);
+				boostingCells.push(newCell);
+				playerCells.push(newCell);
 			}
 			cell.r = splitSize;
 		}
@@ -509,28 +475,10 @@ const worldTick = () => {
 			a.fed = 0;
 			a.r = settings.virusSize;
 			const angle = Math.atan2(b.boostUnitY, b.boostUnitX);
-			const virus = {
-				type: CELL_TYPE_VIRUS,
-				id: nextCellId++,
-				x: a.x,
-				y: a.y,
-				r: settings.virusSize,
-				rgb: 0x33ff33,
-				born: now,
-				moved: now,
-				dead: false,
-				deadTo: 0,
-				owner: PLAYER_OWNER_SERVER,
-				boostUnitX: Math.cos(angle),
-				boostUnitY: Math.sin(angle),
-				boostMagnitude: settings.virusSplitBoost,
-				encodingMove: EMPTY_BUFFER,
-				encodingFirst: EMPTY_BUFFER,
-				mergeable: false,
-				fed: 0,
-			};
-			encode(virus);
-			bitgridAdd(virus);
+			const virus = add({
+				type: CELL_TYPE_VIRUS, x: a.x, y: a.y, r: settings.virusSize, rgb: 0x33ff33,
+				boostUnitX: Math.cos(angle), boostUnitY: Math.sin(angle), boostMagnitude: settings.virusSplitBoost,
+			});
 			boostingCells.push(virus);
 			++viruses;
 		}
@@ -549,10 +497,22 @@ const worldTick = () => {
 					const radius = Math.sqrt(perPiece);
 					for (let i = 0; i < amount; ++i) {
 						const angle = Math.random() * 2 * Math.PI;
-						launch(a, radius, Math.cos(angle), Math.sin(angle), settings.playerSplitBoost);
+						const boostUnitX = Math.cos(angle);
+						const boostUnitY = Math.sin(angle);
+						const newCell = add({
+							type: CELL_TYPE_PLAYER,
+							x: a.x + settings.playerSplitDistance * boostUnitX,
+							y: a.y + settings.playerSplitDistance * boostUnitY,
+							r: radius, rgb: a.rgb, owner: a.owner,
+							boostUnitX, boostUnitY, boostMagnitude: settings.playerSplitBoost,
+						});
+						a.owner.owned.add(newCell);
+						boostingCells.push(newCell);
+						playerCells.push(newCell);
 					}
 					a.r = radius;
 				} else {
+					const radii = [];
 					let nextMass = mass / 2;
 					a.r = Math.sqrt(mass / 2);
 					let massLeft = mass / 2;
@@ -560,15 +520,27 @@ const worldTick = () => {
 						if (nextMass / cellsLeft < splitMinMass) break;
 						while (nextMass >= massLeft && cellsLeft > 1)
 							nextMass /= 2;
-						const angle = Math.random() * 2 * Math.PI;
-						launch(a, Math.sqrt(nextMass), Math.cos(angle), Math.sin(angle), settings.playerSplitBoost);
+						radii.push(Math.sqrt(nextMass));
 						massLeft -= nextMass;
 						--cellsLeft;
 					}
 					const radius = Math.sqrt(massLeft / cellsLeft);
-					for (let i = 0; i < cellsLeft; ++i) {
+					for (let i = 0; i < cellsLeft; ++i) radii.push(radius);
+
+					for (let i = 0, l = radii.length; i < l; ++i) {
 						const angle = Math.random() * 2 * Math.PI;
-						launch(a, radius, Math.cos(angle), Math.sin(angle), settings.playerSplitBoost);
+						const boostUnitX = Math.cos(angle);
+						const boostUnitY = Math.sin(angle);
+						const newCell = add({
+							type: CELL_TYPE_PLAYER,
+							x: a.x + settings.playerSplitDistance * boostUnitX,
+							y: a.y + settings.playerSplitDistance * boostUnitY,
+							r: radii[i], rgb: a.rgb, owner: a.owner,
+							boostUnitX, boostUnitY, boostMagnitude: settings.playerSplitBoost,
+						});
+						a.owner.owned.add(newCell);
+						boostingCells.push(newCell);
+						playerCells.push(newCell);
 					}
 				}
 			}
@@ -598,23 +570,35 @@ const worldTick = () => {
 	const gameUpdateTime = performance.now() - start - compileInteractionsTime;
 
 	// now update players
-	// find the largest player first
+	// compile leaderboard, or at least find the largest player
+	const leaderboard = [];
 	let largestPlayer, largestPlayerMass = 0;
-	for (const player of players) {
-		let mass = 0;
-		for (const cell of player.owned) {
-			mass += cell.r * cell.r;
+	if (now % 4 === 0) {
+		for (const player of players) {
+			let mass = 0;
+			for (const cell of player.owned) {
+				mass += cell.r * cell.r;
+			}
+			if (mass) leaderboard.push({ player, mass });
 		}
-		if (mass > largestPlayerMass) [largestPlayer, largestPlayerMass] = [player, mass];
+		leaderboard.sort((a, b) => b.mass - a.mass);
+		largestPlayer = leaderboard[0]?.player;
+		largestPlayerMass = leaderboard[0]?.mass || 0;
+	} else {
+		for (const player of players) {
+			let mass = 0;
+			for (const cell of player.owned) mass += cell.r * cell.r;
+			if (mass > largestPlayerMass) [largestPlayer, largestPlayerMass] = [player, mass];
+		}
 	}
 
 	for (const player of players) {
 		if (player.disconnectedAt) {
-			if (player.state === PLAYER_STATE_PLAYING && now - player.disconnectedAt > 25 * 60) {
+			if (player.state === PLAYER_STATE_PLAYING && now - player.disconnectedAt > settings.worldPlayerDisposeDelay) {
 				j = 0; // remove player's cells
 				for (let i = 0, l = playerCells.length; i < l; ++i) {
 					playerCells[j] = playerCells[i];
-					if (playerCells[j].owner === player) ++j;
+					if (playerCells[j].owner !== player) ++j;
 					else {
 						playerCells[i].dead = true;
 						bitgridRemove(playerCells[i]);
@@ -635,9 +619,19 @@ const worldTick = () => {
 					let dy = player.mouseY - cell.y;
 					let d = Math.hypot(dx, dy);
 					if (d < 1) d = 1, dx = 1, dy = 0;
-					launch(cell, cell.r / settings.playerSplitSizeDiv, dx / d, dy / d, settings.playerSplitBoost);
 
-					cell.r /= settings.playerSplitSizeDiv;
+					const newCell = add({
+						type: CELL_TYPE_PLAYER,
+						x: cell.x + settings.playerSplitDistance * dx / d,
+						y: cell.y + settings.playerSplitDistance * dy / d,
+						r: cell.r / SQRT2, rgb: cell.rgb, owner: cell.owner,
+						boostUnitX: dx / d, boostUnitY: dy / d, boostMagnitude: settings.playerSplitBoost,
+					});
+					cell.owner.owned.add(newCell);
+					boostingCells.push(newCell);
+					playerCells.push(newCell);
+
+					cell.r /= SQRT2;
 					cell.moved = now;
 					encode(cell);
 					bitgridUpdate(cell);
@@ -655,44 +649,20 @@ const worldTick = () => {
 					if (d < 1) d = 1, dx = 1, dy = 0;
 
 					const angle = Math.atan2(dy, dx) + (Math.random() * 2 - 1) * settings.ejectDispersion;
-					const eject = {
-						type: CELL_TYPE_EJECT,
-						id: nextCellId++,
-						x: cell.x + cell.r * dx / d,
-						y: cell.y + cell.r * dy / d,
-						r: settings.ejectedSize,
-						rgb: cell.rgb,
-						born: now,
-						moved: now,
-						dead: false,
-						deadTo: 0,
-						owner: PLAYER_OWNER_SERVER,
-						boostUnitX: Math.cos(angle),
-						boostUnitY: Math.sin(angle),
+					const eject = add({
+						type: CELL_TYPE_EJECT, x: cell.x + cell.r * dx / d, y: cell.y + cell.r * dy / d,
+						r: settings.ejectedSize, rgb: cell.rgb,
+						boostUnitX: Math.cos(angle), boostUnitY: Math.sin(angle),
 						boostMagnitude: settings.ejectedCellBoost,
-						encodingMove: EMPTY_BUFFER,
-						encodingFirst: EMPTY_BUFFER,
-						mergeable: false,
-						fed: 0,
-					};
-					bitgridAdd(eject);
-					encode(eject);
+					});
 					boostingCells.push(eject);
 
-					cell.r = Math.sqrt(cell.r * cell.r - eject.r * eject.r);
+					cell.r = Math.sqrt(cell.r * cell.r - settings.ejectingLoss * settings.ejectingLoss);
 					encode(cell);
 					bitgridUpdate(cell);
 				}
 				player.w = false;
 			}
-
-			// q press, and update state
-			if (player.q) {
-				if (player.state === PLAYER_STATE_ROAM || player.state === PLAYER_STATE_IDLE) player.state = PLAYER_STATE_SPECTATE;
-				else if (player.state === PLAYER_STATE_SPECTATE) player.state = PLAYER_STATE_ROAM;
-				player.q = false;
-			}
-			if (player.state === PLAYER_STATE_SPECTATE && !largestPlayer) player.state = PLAYER_STATE_ROAM;
 
 			// spawn request
 			if (!player.owned.size) {
@@ -707,36 +677,22 @@ const worldTick = () => {
 
 						const spawnSize = player.minionCommander ? settings.minionSpawnSize : settings.playerSpawnSize;
 						const [x, y] = safeSpawnPos(spawnSize);
-						const rgb = randomColors[~~(Math.random() * 256 * 6)];
-						const cell = {
-							type: CELL_TYPE_PLAYER,
-							id: nextCellId++,
-							x,
-							y,
-							r: spawnSize,
-							rgb,
-							born: now,
-							moved: now,
-							dead: false,
-							deadTo: 0,
-							owner: player,
-							boostUnitX: 0,
-							boostUnitY: 0,
-							boostMagnitude: 0,
-							encodingMove: EMPTY_BUFFER,
-							encodingFirst: EMPTY_BUFFER,
-							mergeable: false,
-							fed: 0,
-						};
-						player.rgb = rgb;
+						const rgb = player.rgb = randomColors[~~(Math.random() * 256 * 6)];
+						const cell = add({ type: CELL_TYPE_PLAYER, x, y, r: spawnSize, rgb, owner: player });
 						player.owned.add(cell);
-						bitgridAdd(cell);
-						encode(cell);
 						playerCells.push(cell);
 					}
 				}
 			}
 			if (player.spawn) player.spawn = undefined; // it should have been processed by now
+
+			// q press, and update state
+			if (player.q) {
+				if (player.state === PLAYER_STATE_ROAM || player.state === PLAYER_STATE_IDLE) player.state = PLAYER_STATE_SPECTATE;
+				else if (player.state === PLAYER_STATE_SPECTATE) player.state = PLAYER_STATE_ROAM;
+				player.q = false;
+			}
+			if (player.state === PLAYER_STATE_SPECTATE && !largestPlayer) player.state = PLAYER_STATE_ROAM;
 
 			// update view area
 			if (player.state === PLAYER_STATE_PLAYING) {
@@ -794,7 +750,6 @@ const worldTick = () => {
 		if (!player.minionCommander) continue;
 		let minions = minionsPerPlayer.get(player.minionCommander) || 0;
 		if (minions > targetMinionsPerPlayer || player.minionCommander.state !== PLAYER_STATE_PLAYING) {
-			players.delete(player);
 			player.disconnectedAt = -Infinity; // make sure its cells are immediately deleted
 		} else {
 			minionsPerPlayer.set(player.minionCommander, minions + 1);
@@ -825,6 +780,7 @@ const worldTick = () => {
 				splits: 0,
 				state: PLAYER_STATE_IDLE,
 				sub: false,
+				updated: now,
 				visibleCells: new Set(),
 				w: false,
 			});
@@ -840,11 +796,11 @@ const worldTick = () => {
 		playing: playingExternal,
 		spectating,
 		name: settings.serverName,
-		gamemode: 'FFA',
-		loadTime: tickTimes[(now - 1 + 25) % 25],
+		gamemode: settings.serverGamemode,
+		loadTime: tickTimes[(now - 1 + 25) % 25]?.time ?? 0,
 		uptime: ~~((performance.now() - serverStartTime) / 1000),
 		// legacy
-		mode: 'FFA',
+		mode: settings.serverGamemode,
 		update: loadTime,
 		playersTotal: playingExternal + spectating,
 		playersAlive: playingExternal,
@@ -852,32 +808,20 @@ const worldTick = () => {
 		playersLimit: settings.listenerMaxConnections,
 	}))]);
 
-	// compile leaderboard
-	const leaderboard = [];
-	if (now % 4 === 0) {
-		for (const player of players) {
-			let mass = 0;
-			for (const cell of player.owned) {
-				mass += cell.r * cell.r;
-			}
-			if (mass) leaderboard.push({ player, mass });
-		}
-		leaderboard.sort((a, b) => b.mass - a.mass);
-	}
-
 	const updatePlayersTime = performance.now() - start - gameUpdateTime;
 
 	// #2 update connections
 	let botsSeen = 0;
 	for (const player of players) {
 		if (player.disconnectedAt) continue;
-		if (now - player.updated >= 60 * 25) {
-			player.close();
+		if (now - player.updated >= settings.listenerMaxClientDormancy / 40) {
+			if (!player.bot && !player.minionCommander) player.ws.close();
+			else player.disconnectedAt = -Infinity;
 			continue;
 		}
 
 		if (player.state === PLAYER_STATE_LIMBO) {
-			// TODO enqueue into matchmaker if player.spawn
+			player.state = PLAYER_STATE_IDLE;
 			player.spawn = undefined; // but make sure matchmaker enqueue is done first
 			player.w = player.q = false;
 			player.splits = 0;
@@ -889,6 +833,7 @@ const worldTick = () => {
 			player.mouseY = player.minionCommander.mouseY;
 			player.splits = 1;
 			if (!player.owned.size) player.spawn = MINION_SPAWN;
+			player.updated = now;
 			continue;
 		}
 
@@ -903,17 +848,18 @@ const worldTick = () => {
 		const xmax = ~~(Math.min(cameraXmax + settings.worldMapW, settings.worldMapW * 2) / BITGRID_TILE_SIZE);
 		const ymin = ~~(Math.max(cameraYmin + settings.worldMapH, 0) / BITGRID_TILE_SIZE);
 		const ymax = ~~(Math.min(cameraYmax + settings.worldMapH, settings.worldMapH * 2) / BITGRID_TILE_SIZE);
-		if (!player.bot || now % settings.worldPlayerBotsPerWorld === botsSeen++) {
-			// only compute bots' new visible cells once in a while
-			bitgridSearch(xmin, xmax, ymin, ymax, cell => {
-				if (cameraXmin <= cell.x + cell.r && cell.x - cell.r <= cameraXmax
-					&& cameraYmin <= cell.y + cell.r && cell.y - cell.r <= cameraYmax) {
-					visibleCells.add(cell);
-				}
-			});
-		} else visibleCells = player.visibleCells;
+		bitgridSearch(xmin, xmax, ymin, ymax, cell => {
+			if (cameraXmin <= cell.x + cell.r && cell.x - cell.r <= cameraXmax
+				&& cameraYmin <= cell.y + cell.r && cell.y - cell.r <= cameraYmax) {
+				visibleCells.add(cell);
+			}
+		});
+
+		const oldVisibleCells = player.visibleCells;
+		player.visibleCells = visibleCells;
 
 		if (player.bot) {
+			player.updated = now;
 			// copied straight from OgarII, just like everything else, not my logic
 			let ai = playerBotAi.get(player);
 			if (!ai) playerBotAi.set(player, ai = { splitCooldownTicks: 0, target: undefined });
@@ -938,7 +884,7 @@ const worldTick = () => {
 			if (!leader) continue;
 
 			if (ai.target) {
-				if (ai.target.dead || cell.r <= ai.target.r * settings.worldEatMult) {
+				if (ai.target.dead || leader.r <= ai.target.r * WORLD_EAT_MULT) {
 					ai.target = undefined;
 				} else {
 					player.mouseX = ai.target.x;
@@ -952,7 +898,7 @@ const worldTick = () => {
 			let bestPrey = undefined;
 			let splitKillObstacleNearby = false;
 
-			const splitDistance = Math.max(leader.r / settings.playerSplitSizeDiv, settings.playerSplitBoost); 
+			const splitDistance = Math.max(leader.r / SQRT2, settings.playerSplitBoost); 
 
 			for (const cell of visibleCells) {
 				const dx = cell.x - leader.x;
@@ -965,19 +911,19 @@ const worldTick = () => {
 					influence = 1;
 				} else {
 					const truncatedInfluence = Math.log10(cell.r * cell.r);
-					const canSplitKill = leader.r / settings.playerSplitSizeDiv > cell.r * settings.worldEatMult
+					const canSplitKill = leader.r / SQRT2 > cell.r * WORLD_EAT_MULT
 						&& d - splitDistance <= leader.r - cell.r / settings.worldEatOverlapDiv;
-					const canEat = leader.r >= cell.r * settings.worldEatMult;
+					const canEat = leader.r >= cell.r * WORLD_EAT_MULT;
 					if (cell.type === CELL_TYPE_PLAYER) {
 						if (cell.owner !== player) {
 							if (canEat) {
 								influence = truncatedInfluence;
 								if (canSplitKill && (!bestPrey || cell.r > bestPrey.r)) bestPrey = cell;
+							} else {
+								if (cell.r < leader.r * WORLD_EAT_MULT) influence = -1;
+								else influence = -truncatedInfluence * player.owned.size;
+								splitKillObstacleNearby = true;
 							}
-						} else {
-							if (cell.r < leader.r * settings.worldEatMult) influence = -1;
-							else influence = -truncatedInfluence * player.owned.size;
-							splitKillObstacleNearby = true;
 						}
 					} else if (cell.type === CELL_TYPE_VIRUS) {
 						if (player.owned.size >= settings.playerMaxCells) influence = truncatedInfluence;
@@ -993,19 +939,19 @@ const worldTick = () => {
 				if (d === 0) d = 1;
 				mouseX += dx / d * influence / d;
 				mouseY += dy / d * influence / d;
+			}
 
-				if (player.owned.size <= 2 && !splitKillObstacleNearby && ai.splitCooldownTicks <= 0
-					&& bestPrey && bestPrey.r * 2 > leader.r) {
-					ai.target = bestPrey;
-					player.mouseX = bestPrey.x;
-					player.mouseY = bestPrey.y;
-					++player.splits;
-					ai.splitCooldownTicks = 25;
-				} else {
-					const d = Math.max(1, Math.hypot(mouseX, mouseY));
-					player.mouseX = leader.x + mouseX / d * cameraWidth;
-					player.mouseY = leader.y + mouseY / d * cameraHeight;
-				}
+			if (player.owned.size <= 2 && !splitKillObstacleNearby && ai.splitCooldownTicks <= 0
+				&& bestPrey && bestPrey.r * 2 > leader.r) {
+				ai.target = bestPrey;
+				player.mouseX = bestPrey.x;
+				player.mouseY = bestPrey.y;
+				++player.splits;
+				ai.splitCooldownTicks = 25;
+			} else {
+				const d = Math.max(1, Math.hypot(mouseX, mouseY));
+				player.mouseX = leader.x + mouseX / d * cameraWidth;
+				player.mouseY = leader.y + mouseY / d * cameraHeight;
 			}
 
 			continue;
@@ -1033,8 +979,6 @@ const worldTick = () => {
 		// the new Set.prototype.difference and .intersection functions are only faster if the two sets are very
 		// disjoint, but usually they aren't (a player can't move that far between ticks)
 		// also, they were only added in node.js 22, which is quite recent, so better to stick with the old method
-		const oldVisibleCells = player.visibleCells;
-		player.visibleCells = visibleCells;
 		const newOwned = [];
 		const eat = [];
 		const add = [];
@@ -1099,7 +1043,13 @@ const worldTick = () => {
 	// #4 update gamemode-specific
 
 	const time = performance.now() - start;
-	tickTimes[now % 25] = { compileInteractionsTime, gameUpdateTime, updatePlayersTime, updateConnectionsTime: time };
+	tickTimes[now % 25] = {
+		compileInteractionsTime,
+		gameUpdateTime,
+		updatePlayersTime,
+		updateConnectionsTime: time - updatePlayersTime,
+		time,
+	};
 	++now;
 	setTimeout(worldTick, Math.max(40 - time, 0));
 };
@@ -1138,7 +1088,7 @@ const messagePacket = (flags, color, name, message) => {
 
 let cliChatMuted = false;
 
-const wss = new WebSocketServer({ port: 80 }); // TODO noPort, then implement /server/recaptcha/v3 and all that
+const wss = new WebSocketServer({ port: settings.listeningPort }); // TODO noPort, then implement /server/recaptcha/v3 and all that
 wss.on('connection', client => {
 	let player;
 	setTimeout(() => {
@@ -1243,10 +1193,6 @@ wss.on('connection', client => {
 			if (buf.byteLength < 2) return client.close(1003, 'Bad message format');
 			++o; // skip flags altogether
 			const message = readUtf8().trim();
-			console.log('chat:', message);
-			// TODO chat message, filtering and all that
-			// DO THIS TOMORROW, then leaderboard, then border collisions, then viruses
-			// and i think that's it maybe
 			if (message[0] === '/' && message.length >= 2) {
 				let [command, ...args] = message.split(' ');
 				command = command.toLowerCase();
@@ -1307,6 +1253,7 @@ wss.on('connection', client => {
 			}
 
 			if (now - player.chatAt < 5) return; // no cooldown on commands (respawns), but slow down chats
+			player.chatAt = now;
 			const trimmed = message.substring(0, 32);
 			const packet = messagePacket(
 				0,
@@ -1407,13 +1354,14 @@ const ask = input => {
 			let avgGameUpdateTime = 0;
 			let avgUpdatePlayersTime = 0;
 			let avgUpdateConnectionsTime = 0;
+			let avgTickTime = 0;
 			for (const frame of tickTimes) {
 				avgCompileInteractionsTime += frame.compileInteractionsTime;
 				avgGameUpdateTime += frame.gameUpdateTime;
 				avgUpdatePlayersTime += frame.updatePlayersTime;
 				avgUpdateConnectionsTime += frame.updateConnectionsTime;
+				avgTickTime += frame.time;
 			}
-			const avgTickTime = avgCompileInteractionsTime + avgGameUpdateTime + avgUpdatePlayersTime + avgUpdateConnectionsTime;
 			console.log(`load:   ${(avgTickTime / 25).toFixed(2)} ms / 40 ms`);
 			console.log(`        ${(avgCompileInteractionsTime / 25).toFixed(2)} ms -> ${(avgGameUpdateTime / 25).toFixed(2)} ms -> ${(avgUpdatePlayersTime / 25).toFixed(2)} ms -> ${(avgUpdateConnectionsTime / 25).toFixed(2)} ms`);
 
@@ -1454,6 +1402,8 @@ const ask = input => {
 		} else if (command === 'unmute') {
 			cliChatMuted = false;
 			console.log('chat now unmuted on the cli');
+		} else {
+			console.log('unknown command');
 		}
 	}
 	commandStream.question('@ ', ask);
