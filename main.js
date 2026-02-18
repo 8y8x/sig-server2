@@ -295,12 +295,14 @@ const encode = cell => {
 
 const MINION_SPAWN = { name: encodeUtf8(settings.minionName), skin: EMPTY_STRING, spectating: false, sub: false };
 
+let lastLargestPlayerVisibleCells = new Set();
 const worldEatArray = [];
 const worldRigidArray = [];
 const worldTick = () => {
 	const start = performance.now();
 
 	// #1 update world
+	const tickMetrics = {};
 
 	if (nextCellId >= 4e9) nextCellId = 1;
 
@@ -419,7 +421,7 @@ const worldTick = () => {
 		});
 	}
 
-	const compileInteractionsTime = performance.now() - start;
+	tickMetrics.cells1 = performance.now() - start;
 
 	for (let i = 0; i < rigidL; i += 2) {
 		const a = rigid[i];
@@ -558,7 +560,7 @@ const worldTick = () => {
 	}
 	playerCells.length = j;
 
-	const gameUpdateTime = performance.now() - start - compileInteractionsTime;
+	tickMetrics.cells2 = performance.now() - start - tickMetrics.cells1;
 
 	// now update players
 	// compile leaderboard, or at least find the largest player
@@ -608,8 +610,9 @@ const worldTick = () => {
 			for (let i = 0; i < player.splits; ++i) {
 				let remaining = player.owned.size;
 				for (const cell of player.owned) {
-					if (player.owned.size >= settings.playerMaxCells || !remaining--) break;
+					if (player.owned.size >= settings.playerMaxCells) break;
 					if (cell.r < settings.playerMinSplitSize) continue;
+					if (!remaining--) break;
 
 					let dx = player.mouseX - cell.x;
 					let dy = player.mouseY - cell.y;
@@ -717,10 +720,13 @@ const worldTick = () => {
 						scale: settings.playerRoamViewScale,
 					};
 				}
-			} else if (player.state === PLAYER_STATE_SPECTATE) {
-				player.camera = largestPlayer.camera;
 			}
 		}
+	}
+
+	// do this afterwards, to make sure largestPlayer.camera is up-to-date
+	for (const player of players) {
+		if (player.state === PLAYER_STATE_SPECTATE) player.camera = largestPlayer.camera;
 	}
 
 	// update stats, this will also be used for minions
@@ -823,6 +829,8 @@ const worldTick = () => {
 		});
 	}
 
+	tickMetrics.cells3 = performance.now() - start - tickMetrics.cells2;
+
 	// compile statistics
 	let avgTickTime = 0;
 	for (const frame of tickTimes) avgTickTime += frame.time;
@@ -845,10 +853,8 @@ const worldTick = () => {
 		playersLimit: settings.listenerMaxConnections,
 	}))]);
 
-	const updatePlayersTime = performance.now() - start - gameUpdateTime;
-
 	// #2 update connections
-	let botsSeen = 0;
+	const newVisibleCells = new Map();
 	for (const player of players) {
 		if (player.disconnectedAt) continue;
 		if (now - player.updated >= settings.listenerMaxClientDormancy / 40) {
@@ -874,7 +880,14 @@ const worldTick = () => {
 			continue;
 		}
 
-		let visibleCells = new Set(player.owned);
+		if (newVisibleCells.has(player.camera)) continue;
+
+		// this is not exact; if you're spectating #1, but they have some cells beyond their camera range, you aren't
+		// supposed to be able to see them. but it doesn't really matter here, it's all in the name of performance
+		let visibleCells;
+		if (player.camera === largestPlayer?.camera) visibleCells = new Set(largestPlayer.owned);
+		else visibleCells = new Set(player.owned);
+
 		const cameraWidth = 1920 / player.camera.scale / 2 * settings.playerViewScaleMult;
 		const cameraHeight = 1080 / player.camera.scale / 2 * settings.playerViewScaleMult;
 		const cameraXmin = player.camera.x - cameraWidth;
@@ -892,107 +905,19 @@ const worldTick = () => {
 			}
 		});
 
+		newVisibleCells.set(player.camera, visibleCells);
+	}
+
+	tickMetrics.con1 = performance.now() - start - tickMetrics.cells3;
+
+	for (const player of players) {
+		if (player.disconnectedAt || player.minionCommander || player.bot) continue;
+
+		const visibleCells = newVisibleCells.get(player.camera);
+		if (!visibleCells) continue; // could happen if the player was just in limbo
+
 		const oldVisibleCells = player.visibleCells;
 		player.visibleCells = visibleCells;
-
-		if (player.bot) {
-			player.updated = now;
-			// copied straight from OgarII, just like everything else, not my logic
-			let ai = playerBotAi.get(player);
-			if (!ai) playerBotAi.set(player, ai = { splitCooldownTicks: 0, target: undefined });
-
-			if (ai.splitCooldownTicks) --ai.splitCooldownTicks;
-			else ai.target = undefined;
-
-			if (player.state !== PLAYER_STATE_PLAYING) {
-				player.spawn = {
-					name: PLAYER_BOT_NAMES[~~(Math.random() * PLAYER_BOT_NAMES.length)],
-					skin: PLAYER_BOT_SKINS[~~(Math.random() * PLAYER_BOT_SKINS.length)],
-					spectating: false,
-					sub: false,
-				};
-				continue;
-			}
-
-			let leader;
-			for (const cell of player.owned) {
-				if (!leader || cell.r > leader.r) leader = cell;
-			}
-			if (!leader) continue;
-
-			if (ai.target) {
-				if (ai.target.dead || leader.r <= ai.target.r * WORLD_EAT_MULT) {
-					ai.target = undefined;
-				} else {
-					player.mouseX = ai.target.x;
-					player.mouseY = ai.target.y;
-					continue;
-				}
-			}
-
-			let mouseX = 0;
-			let mouseY = 0;
-			let bestPrey = undefined;
-			let splitKillObstacleNearby = false;
-
-			const splitDistance = Math.max(leader.r / SQRT2, settings.playerSplitBoost); 
-
-			for (const cell of visibleCells) {
-				const dx = cell.x - leader.x;
-				const dy = cell.y - leader.y;
-				const dSplit = Math.max(1, Math.hypot(dx, dy));
-				const d = Math.max(1, dSplit - cell.r - leader.r);
-				let influence = 0;
-
-				if (cell.type === CELL_TYPE_PELLET) {
-					influence = 1;
-				} else {
-					const truncatedInfluence = Math.log10(cell.r * cell.r);
-					const canSplitKill = leader.r / SQRT2 > cell.r * WORLD_EAT_MULT
-						&& d - splitDistance <= leader.r - cell.r * WORLD_EAT_OVERLAP_MULT;
-					const canEat = leader.r >= cell.r * WORLD_EAT_MULT;
-					if (cell.type === CELL_TYPE_PLAYER) {
-						if (cell.owner !== player) {
-							if (canEat) {
-								influence = truncatedInfluence;
-								if (canSplitKill && (!bestPrey || cell.r > bestPrey.r)) bestPrey = cell;
-							} else {
-								if (cell.r < leader.r * WORLD_EAT_MULT) influence = -1;
-								else influence = -truncatedInfluence * player.owned.size;
-								splitKillObstacleNearby = true;
-							}
-						}
-					} else if (cell.type === CELL_TYPE_VIRUS) {
-						if (player.owned.size >= settings.playerMaxCells) influence = truncatedInfluence;
-						else if (canEat) {
-							influence = -1 * player.owned.size;
-							if (canSplitKill) splitKillObstacleNearby = true;
-						}
-					} else if (cell.type === CELL_TYPE_EJECT) {
-						influence = truncatedInfluence * player.owned.size;
-					}
-				}
-
-				if (d === 0) d = 1;
-				mouseX += dx / d * influence / d;
-				mouseY += dy / d * influence / d;
-			}
-
-			if (player.owned.size <= 2 && !splitKillObstacleNearby && ai.splitCooldownTicks <= 0
-				&& bestPrey && bestPrey.r * 2 > leader.r) {
-				ai.target = bestPrey;
-				player.mouseX = bestPrey.x;
-				player.mouseY = bestPrey.y;
-				++player.splits;
-				ai.splitCooldownTicks = 25;
-			} else {
-				const d = Math.max(1, Math.hypot(mouseX, mouseY));
-				player.mouseX = leader.x + mouseX / d * cameraWidth;
-				player.mouseY = leader.y + mouseY / d * cameraHeight;
-			}
-
-			continue;
-		}
 
 		// leaderboard (must be recomputed for every player, because of "myPosition")
 		let o = 0;
@@ -1076,19 +1001,120 @@ const worldTick = () => {
 		player.ws.send(writer.subarray(0, o));
 	}
 
+	tickMetrics.con2 = performance.now() - start - tickMetrics.con1;
+
+	for (const player of players) {
+		if (!player.bot || player.disconnectedAt) continue;
+
+		const visibleCells = newVisibleCells.get(player.camera);
+
+		player.updated = now;
+		// copied straight from OgarII, just like everything else, not my logic
+		let ai = playerBotAi.get(player);
+		if (!ai) playerBotAi.set(player, ai = { splitCooldownTicks: 0, target: undefined });
+
+		if (ai.splitCooldownTicks) --ai.splitCooldownTicks;
+		else ai.target = undefined;
+
+		if (player.state !== PLAYER_STATE_PLAYING) {
+			player.spawn = {
+				name: PLAYER_BOT_NAMES[~~(Math.random() * PLAYER_BOT_NAMES.length)],
+				skin: PLAYER_BOT_SKINS[~~(Math.random() * PLAYER_BOT_SKINS.length)],
+				spectating: false,
+				sub: false,
+			};
+			continue;
+		}
+
+		let leader;
+		for (const cell of player.owned) {
+			if (!leader || cell.r > leader.r) leader = cell;
+		}
+		if (!leader) continue;
+
+		if (ai.target) {
+			if (ai.target.dead || leader.r <= ai.target.r * WORLD_EAT_MULT) {
+				ai.target = undefined;
+			} else {
+				player.mouseX = ai.target.x;
+				player.mouseY = ai.target.y;
+				continue;
+			}
+		}
+
+		let mouseX = 0;
+		let mouseY = 0;
+		let bestPrey = undefined;
+		let splitKillObstacleNearby = false;
+
+		const splitDistance = Math.max(leader.r / SQRT2, settings.playerSplitBoost); 
+
+		for (const cell of visibleCells) {
+			const dx = cell.x - leader.x;
+			const dy = cell.y - leader.y;
+			const dSplit = Math.max(1, Math.hypot(dx, dy));
+			const d = Math.max(1, dSplit - cell.r - leader.r);
+			let influence = 0;
+
+			if (cell.type === CELL_TYPE_PELLET) {
+				influence = 1;
+			} else {
+				const truncatedInfluence = Math.log10(cell.r * cell.r);
+				const canSplitKill = leader.r / SQRT2 > cell.r * WORLD_EAT_MULT
+					&& d - splitDistance <= leader.r - cell.r * WORLD_EAT_OVERLAP_MULT;
+				const canEat = leader.r >= cell.r * WORLD_EAT_MULT;
+				if (cell.type === CELL_TYPE_PLAYER) {
+					if (cell.owner !== player) {
+						if (canEat) {
+							influence = truncatedInfluence;
+							if (canSplitKill && (!bestPrey || cell.r > bestPrey.r)) bestPrey = cell;
+						} else {
+							if (cell.r < leader.r * WORLD_EAT_MULT) influence = -1;
+							else influence = -truncatedInfluence * player.owned.size;
+							splitKillObstacleNearby = true;
+						}
+					}
+				} else if (cell.type === CELL_TYPE_VIRUS) {
+					if (player.owned.size >= settings.playerMaxCells) influence = truncatedInfluence;
+					else if (canEat) {
+						influence = -1 * player.owned.size;
+						if (canSplitKill) splitKillObstacleNearby = true;
+					}
+				} else if (cell.type === CELL_TYPE_EJECT) {
+					influence = truncatedInfluence * player.owned.size;
+				}
+			}
+
+			if (d === 0) d = 1;
+			mouseX += dx / d * influence / d;
+			mouseY += dy / d * influence / d;
+		}
+
+		if (player.owned.size <= 2 && !splitKillObstacleNearby && ai.splitCooldownTicks <= 0
+			&& bestPrey && bestPrey.r * 2 > leader.r) {
+			ai.target = bestPrey;
+			player.mouseX = bestPrey.x;
+			player.mouseY = bestPrey.y;
+			++player.splits;
+			ai.splitCooldownTicks = 25;
+		} else {
+			const cameraWidth = 1920 / player.camera.scale / 2 * settings.playerViewScaleMult;
+			const cameraHeight = 1080 / player.camera.scale / 2 * settings.playerViewScaleMult;
+			const d = Math.max(1, Math.hypot(mouseX, mouseY));
+			player.mouseX = leader.x + mouseX / d * cameraWidth;
+			player.mouseY = leader.y + mouseY / d * cameraHeight;
+		}
+	}
+
+	tickMetrics.con3 = performance.now() - start - tickMetrics.con2;
+
 	// #3 update matchmaker
 	// #4 update gamemode-specific
 
-	const time = performance.now() - start;
-	tickTimes[now % 25] = {
-		compileInteractionsTime,
-		gameUpdateTime,
-		updatePlayersTime,
-		updateConnectionsTime: time - updatePlayersTime,
-		time,
-	};
+	tickMetrics.time = performance.now() - start;
+	tickTimes[now % 25] = tickMetrics;
 	++now;
-	setTimeout(worldTick, Math.max(40 - time, 0));
+	setTimeout(worldTick, Math.max(40 - tickMetrics.time, 0));
 };
 worldTick();
 
@@ -1390,21 +1416,24 @@ const ask = input => {
 			const path = require('v8').writeHeapSnapshot();
 			console.log(`written in ${(performance.now() - start).toFixed(2)} ms to ${path}`);
 		} else if (command === 'stats') {
-			// { compileInteractionsTime, gameUpdateTime, updatePlayersTime, updateConnectionsTime: time };
-			let avgCompileInteractionsTime = 0;
-			let avgGameUpdateTime = 0;
-			let avgUpdatePlayersTime = 0;
-			let avgUpdateConnectionsTime = 0;
+			let avgCells1 = 0, avgCells2 = 0, avgCells3 = 0, avgCon1 = 0, avgCon2 = 0, avgCon3 = 0;
 			let avgTickTime = 0;
 			for (const frame of tickTimes) {
-				avgCompileInteractionsTime += frame.compileInteractionsTime;
-				avgGameUpdateTime += frame.gameUpdateTime;
-				avgUpdatePlayersTime += frame.updatePlayersTime;
-				avgUpdateConnectionsTime += frame.updateConnectionsTime;
+				avgCells1 += frame.cells1;
+				avgCells2 += frame.cells2;
+				avgCells3 += frame.cells3;
+				avgCon1 += frame.con1;
+				avgCon2 += frame.con2;
+				avgCon3 += frame.con3;
 				avgTickTime += frame.time;
 			}
-			console.log(`load:   ${(avgTickTime / 25).toFixed(2)} ms / 40 ms`);
-			console.log(`        ${(avgCompileInteractionsTime / 25).toFixed(2)} ms -> ${(avgGameUpdateTime / 25).toFixed(2)} ms -> ${(avgUpdatePlayersTime / 25).toFixed(2)} ms -> ${(avgUpdateConnectionsTime / 25).toFixed(2)} ms`);
+			console.log(`load:   ${(avgTickTime / 25).toFixed(2)} ms / 40 ms (${(avgTickTime / 25 * 2.5).toFixed(2)}%)`);
+			console.log(`     -> ${(avgCells1 / 25).toFixed(2)} ms (cells1)`);
+			console.log(`     -> ${(avgCells2 / 25).toFixed(2)} ms (cells2)`);
+			console.log(`     -> ${(avgCells3 / 25).toFixed(2)} ms (cells3)`);
+			console.log(`     -> ${(avgCon1 / 25).toFixed(2)} ms (con1, update visible cells)`);
+			console.log(`     -> ${(avgCon2 / 25).toFixed(2)} ms (con2, create packets)`);
+			console.log(`     -> ${(avgCon3 / 25).toFixed(2)} ms (con3, update player bots)`);
 
 			const memory = process.memoryUsage();
 			const pretty = value => {
@@ -1453,16 +1482,15 @@ commandStream.question('@ ', ask);
 
 const log = fs.createWriteStream(`log-${new Date().toISOString()}.txt`);
 setInterval(() => {
-	let avg1 = 0;
-	let avg2 = 0;
-	let avg3 = 0;
-	let avg4 = 0;
+	let avgCells1 = 0, avgCells2 = 0, avgCells3 = 0, avgCon1 = 0, avgCon2 = 0, avgCon3 = 0;
 	let avgTickTime = 0;
 	for (const frame of tickTimes) {
-		avg1 += frame.compileInteractionsTime;
-		avg2 += frame.gameUpdateTime;
-		avg3 += frame.updatePlayersTime;
-		avg4 += frame.updateConnectionsTime;
+		avgCells1 += frame.cells1;
+		avgCells2 += frame.cells2;
+		avgCells3 += frame.cells3;
+		avgCon1 += frame.con1;
+		avgCon2 += frame.con2;
+		avgCon3 += frame.con3;
 		avgTickTime += frame.time;
 	}
 	let realPellets = 0, realViruses = 0, realEjects = 0, realPlayerCells = 0, realCells = 0;
@@ -1481,5 +1509,5 @@ setInterval(() => {
 		else if (player.state === PLAYER_STATE_PLAYING) ++playing;
 		else ++idle;
 	}
-	log.write(`${new Date().toISOString()} | ${(avg1 / tickTimes.length).toFixed(2)} -> ${(avg2 / tickTimes.length).toFixed(2)} -> ${(avg3 / tickTimes.length).toFixed(2)} -> ${(avg4 / tickTimes.length).toFixed(2)} (${(avgTickTime / tickTimes.length * 2.5).toFixed(1)}% load) | ${playing} playing, ${spectating} spectating, ${idle} idle, ${minions} minions, ${bots} bots | ${realPellets}(${pellets}) pellets, ${realViruses}(${viruses}), ${realEjects} ejects, ${realPlayerCells} player cells, ${realCells} total cells\n`);
+	log.write(`${new Date().toISOString()} | ${(avgCells1 / 25).toFixed(2)} -> ${(avgCells2 / 25).toFixed(2)} -> ${(avgCells3 / 25).toFixed(2)} -> ${(avgCon1 / 25).toFixed(2)} -> ${(avgCon2 / 25).toFixed(2)} -> ${(avgCon3 / 25).toFixed(2)} (${(avgTickTime / 25 * 2.5).toFixed(1)}% load) | ${playing} playing, ${spectating} spectating, ${idle} idle, ${minions} minions, ${bots} bots | ${realPellets}(${pellets}) pellets, ${realViruses}(${viruses}), ${realEjects} ejects, ${realPlayerCells} player cells, ${realCells} total cells\n`);
 }, 15_000);
