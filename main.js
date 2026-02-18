@@ -610,9 +610,8 @@ const worldTick = () => {
 			for (let i = 0; i < player.splits; ++i) {
 				let remaining = player.owned.size;
 				for (const cell of player.owned) {
-					if (player.owned.size >= settings.playerMaxCells) break;
+					if (!remaining-- || player.owned.size >= settings.playerMaxCells) break;
 					if (cell.r < settings.playerMinSplitSize) continue;
-					if (!remaining--) break;
 
 					let dx = player.mouseX - cell.x;
 					let dy = player.mouseY - cell.y;
