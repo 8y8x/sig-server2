@@ -1362,6 +1362,7 @@ const ask = input => {
 			console.log('help - show this help screen');
 			console.log('mute - stop showing chat on the command line');
 			console.log('players - shows a list of all real player and their names');
+			console.log('safeexit - calls process.exit(0) as soon as there are 0 players playing');
 			console.log('setting <name> <value> - changes a setting to a different value, or shows the current value');
 			console.log('snapshot - dumps a memory snapshot, this can take several seconds');
 			console.log('stats - show server uptime, load, memory usage, and player counts');
@@ -1387,6 +1388,15 @@ const ask = input => {
 
 				console.log(`- ${stateName} - ${~~mass} mass - ${player.name}`);
 			}
+		} else if (command === 'safeexit') {
+			console.log('server will be exited once all players leave');
+			setInterval(() => {
+				for (const player of players) {
+					if (player.minionCommander || player.bot) continue;
+					if (player.state === PLAYER_STATE_PLAYING) return;
+				}
+				process.exit(0);
+			}, 5000);
 		} else if (command === 'say') {
 			// no sever flag, otherwise it gets duplicated between sigfixes tabs
 			const packet = messagePacket(0, 0xc03f3f, SERVER_NAME, encodeUtf8(args.join(' ')));
