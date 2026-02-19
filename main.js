@@ -298,6 +298,10 @@ const MINION_SPAWN = { name: encodeUtf8(settings.minionName), skin: EMPTY_STRING
 let lastLargestPlayerVisibleCells = new Set();
 const worldEatArray = [];
 const worldRigidArray = [];
+const worldPacketEatArray = [];
+const worldPacketAddArray = [];
+const worldPacketUpdArray = [];
+const worldPacketDelArray = [];
 const worldTick = () => {
 	const start = performance.now();
 
@@ -350,8 +354,6 @@ const worldTick = () => {
 	let rigidL = 0;
 	const eat = worldEatArray;
 	const rigid = worldRigidArray;
-	eat.fill(); // set everything to undefined, but do not reduce the allocated size of the array
-	rigid.fill();
 	for (let i = 0, l = boostingCells.length; i < l; ++i) {
 		const cell = boostingCells[i];
 		if (cell.type === CELL_TYPE_PLAYER) continue;
@@ -545,6 +547,9 @@ const worldTick = () => {
 		b.deadTo = a.id;
 		remove(b);
 	}
+
+	eat.fill(undefined, 0, eatL); // set everything to undefined, but do not reduce the allocated size of the array
+	rigid.fill(undefined, 0, rigidL);
 
 	j = 0; // clean up dead boosting cells
 	for (let i = 0, l = boostingCells.length; i < l; ++i) {
@@ -908,6 +913,7 @@ const worldTick = () => {
 
 	tickMetrics.con1 = performance.now() - start - tickMetrics.cells3;
 
+	let maxEatL = 0, maxAddL = 0, maxUpdL = 0, maxDelL = 0;
 	for (const player of players) {
 		if (player.disconnectedAt || player.minionCommander || player.bot) continue;
 
@@ -940,22 +946,23 @@ const worldTick = () => {
 		// disjoint, but usually they aren't (a player can't move that far between ticks)
 		// also, they were only added in node.js 22, which is quite recent, so better to stick with the old method
 		const newOwned = [];
-		const eat = [];
-		const add = [];
-		const upd = [];
-		const del = [];
+		let eatL = 0, addL = 0, updL = 0, delL = 0;
+		const eat = worldPacketEatArray;
+		const add = worldPacketAddArray;
+		const upd = worldPacketUpdArray;
+		const del = worldPacketDelArray;
 		for (const cell of visibleCells) {
 			if (oldVisibleCells.has(cell)) {
-				if (cell.moved === now) upd.push(cell.encodingMove);
+				if (cell.moved === now) upd[updL++] = cell.encodingMove;
 			} else {
 				if (cell.owner === player) newOwned.push(cell.id);
-				add.push(cell.encodingFirst); // TODO only do encodingMove
+				add[addL++] = cell.encodingFirst;
 			}
 		}
 		for (const cell of oldVisibleCells) {
 			if (visibleCells.has(cell)) continue;
-			if (cell.deadTo) eat.push(cell);
-			else del.push(cell); // sigmally: non-sigmally clients require the cell to be in both eat and del
+			if (cell.deadTo) eat[eatL++] = cell;
+			else del[delL++] = cell; // sigmally: non-sigmally clients require the cell to be in both eat and del
 		}
 
 		for (let i = 0; i < newOwned.length; ++i) {
@@ -975,29 +982,40 @@ const worldTick = () => {
 		o = 0;
 		writer.writeUInt8(0x10, o++); // packet: update
 
-		(writer.writeUInt16LE(eat.length, o), o += 2);
-		for (let i = 0, l = eat.length; i < l; ++i) {
+		(writer.writeUInt16LE(eatL, o), o += 2);
+		for (let i = 0; i < eatL; ++i) {
 			(writer.writeUInt32LE(eat[i].deadTo, o), o += 4);
 			(writer.writeUInt32LE(eat[i].id, o), o += 4);
 		}
 
-		for (let i = 0, l = add.length; i < l; ++i) {
+		for (let i = 0; i < addL; ++i) {
 			add[i].copy(writer, o);
 			o += add[i].byteLength;
 		}
-		for (let i = 0, l = upd.length; i < l; ++i) {
+		for (let i = 0; i < updL; ++i) {
 			upd[i].copy(writer, o);
 			o += upd[i].byteLength;
 		}
 		(writer.writeUInt32LE(0, o), o += 4);
 
-		(writer.writeUInt16LE(del.length, o), o += 2);
-		for (let i = 0, l = del.length; i < l; ++i) {
+		(writer.writeUInt16LE(delL, o), o += 2);
+		for (let i = 0; i < delL; ++i) {
 			(writer.writeUInt32LE(del[i].id, o), o += 4);
 		}
 
 		player.ws.send(writer.subarray(0, o));
+
+		if (eatL > maxEatL) maxEatL = eatL;
+		if (addL > maxAddL) maxAddL = addL;
+		if (updL > maxUpdL) maxUpdL = updL;
+		if (delL > maxDelL) maxDelL = delL;
 	}
+
+	// "clear" the array, but do not reduce the allocated size of the array
+	worldPacketEatArray.fill(undefined, 0, maxEatL);
+	worldPacketAddArray.fill(undefined, 0, maxAddL);
+	worldPacketUpdArray.fill(undefined, 0, maxUpdL);
+	worldPacketDelArray.fill(undefined, 0, maxDelL);
 
 	tickMetrics.con2 = performance.now() - start - tickMetrics.con1;
 
