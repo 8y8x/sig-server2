@@ -1392,7 +1392,7 @@ uws.App()
 				const packet = messagePacketU8(
 					0,
 					player.rgb,
-					player.nameU8 === EMPTY_STRING_U8 ? SPECTATOR_NAME : player.nameU8,
+					player.nameU8 === EMPTY_STRING_U8 ? SPECTATOR_NAME_U8 : player.nameU8,
 					encodeUtf8AsU8(trimmed),
 				);
 				for (const otherPlayer of players) {
