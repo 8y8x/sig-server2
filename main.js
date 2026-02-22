@@ -7,17 +7,20 @@ const { WebSocketServer } = require('ws');
 const settings = require('./settings.json');
 const serverStartTime = performance.now(); // probably 0 most of the time, but i don't want to risk it
 
-const EMPTY_BUFFER = Buffer.alloc(0);
-const EMPTY_STRING = Buffer.from([0]);
-const writer = Buffer.alloc(2 ** 22); // 4MB is more than enough, even for the most extreme cases
+const textDecoder = new TextDecoder();
+const textEncoder = new TextEncoder();
+const EMPTY_BUFFER_U8 = new Uint8Array(0);
+const EMPTY_BUFFER_DAT = new DataView(EMPTY_BUFFER_U8.buffer);
+const EMPTY_STRING_U8 = new Uint8Array([0]);
+const EMPTY_STRING_DAT = new DataView(EMPTY_STRING_U8.buffer);
+const writerU8 = new Uint8Array(2 ** 22); // 4MB is more than enough, even for the most extreme cases
+const writerDat = new DataView(writerU8.buffer);
 
-const encodeUtf8 = s => {
-	const base = Buffer.from(s);
-	const out = Buffer.alloc(base.byteLength + 1); // null-terminated
-	for (let o = 0; o < base.byteLength; ++o) {
-		out[o] = base[o] || 0xff; // get rid of null terminators
-	}
-	return out;
+const encodeUtf8AsU8 = s => {
+	const base = textEncoder.encode(s);
+	const u8 = new Uint8Array(base.length + 1); // null-terminated
+	for (let o = 0; o < base.length; ++o) u8[o] = base[o] || 0xff; // get rid of null terminators
+	return u8;
 };
 
 //========== bitgrid ===================================================================================================
@@ -100,18 +103,18 @@ const [PLAYER_STATE_IDLE, PLAYER_STATE_PLAYING, PLAYER_STATE_ROAM, PLAYER_STATE_
 const PLAYER_OWNER_SERVER = {
 	bot: false,
 	camera: { x: 0, y: 0, scale: 1 },
-	clan: EMPTY_STRING,
+	clanU8: EMPTY_STRING_U8,
 	disconnectedAt: 0,
 	lastW: 0,
 	minionCommander: undefined,
 	mouseX: 0,
 	mouseY: 0,
-	name: EMPTY_STRING,
+	nameU8: EMPTY_STRING_U8,
 	owned: new Set(),
 	rgb: 0x7f7f7f,
 	q: false,
 	showClanmates: false,
-	skin: EMPTY_STRING,
+	skinU8: EMPTY_STRING_U8,
 	spawn: undefined,
 	splits: 0,
 	state: PLAYER_STATE_IDLE,
@@ -121,8 +124,10 @@ const PLAYER_OWNER_SERVER = {
 	w: false,
 	ws: {},
 }
-const PLAYER_BOT_NAMES = settings.worldPlayerBotNames.map(x => encodeUtf8(x.replace('{*}', '')));
-const PLAYER_BOT_SKINS = settings.worldPlayerBotSkins.map(encodeUtf8);
+const PLAYER_BOT_NAMES_U8 = settings.worldPlayerBotNames.map(x => encodeUtf8AsU8(x.replace('{*}', '')));
+const PLAYER_BOT_SKINS_U8 = settings.worldPlayerBotSkins.map(encodeUtf8AsU8);
+
+const MINION_SPAWN = { nameU8: encodeUtf8AsU8(settings.minionName), skinU8: EMPTY_STRING_U8, spectating: false, sub: false };
 
 const SQRT2 = Math.sqrt(2);
 const WORLD_EAT_MULT = Math.sqrt(1.3); // must be 30% bigger in mass to eat a cell
@@ -139,7 +144,7 @@ let now = 0; // current tick
 let pellets = 0;
 let viruses = 0;
 
-let statsBuffer = Buffer.concat([Buffer.from([0xfe]), Buffer.from('{}\0')]);
+let statsU8 = new Uint8Array([0xfe, 0x7b, 0x7d, 0]); // \xfe{}\0
 
 const randomColors = new Uint32Array(1536);
 for (let shade = 0; shade < 256; ++shade) {
@@ -177,7 +182,8 @@ const add = cellSkeleton => {
 		born: now, moved: now, dead: false, deadTo: 0,
 		owner: PLAYER_OWNER_SERVER,
 		boostUnitX: 0, boostUnitY: 0, boostMagnitude: 0,
-		encodingMove: EMPTY_BUFFER, encodingFirst: EMPTY_BUFFER,
+		moveU8: EMPTY_BUFFER_U8, moveDat: EMPTY_BUFFER_DAT,
+		firstU8: EMPTY_BUFFER_U8, firstDat: EMPTY_BUFFER_DAT,
 		mergeable: false, fed: 0,
 		...cellSkeleton,
 	};
@@ -188,9 +194,8 @@ const add = cellSkeleton => {
 
 const remove = cell => {
 	bitgridRemove(cell);
-	if (cell.type === CELL_TYPE_PLAYER) {
-		cell.owner.owned.delete(cell);
-	} else if (cell.type === CELL_TYPE_PELLET) --pellets;
+	if (cell.type === CELL_TYPE_PLAYER) cell.owner.owned.delete(cell);
+	else if (cell.type === CELL_TYPE_PELLET) --pellets;
 	else if (cell.type === CELL_TYPE_VIRUS) --viruses;
 	// the cell will be removed from boostingCells and playerCells later
 };
@@ -257,43 +262,46 @@ const safeSpawnPos = (radius) => {
 };
 
 const encode = cell => {
-	let move = cell.encodingMove;
-	const moveByteLength = 14 + cell.owner.clan.byteLength;
-	if (move.byteLength !== moveByteLength) cell.encodingMove = move = Buffer.alloc(moveByteLength);
+	let { moveU8, moveDat } = cell;
+	const moveByteLength = 14 + cell.owner.clanU8.length;
+	if (moveU8.length !== moveByteLength) {
+		cell.moveU8 = moveU8 = new Uint8Array(moveByteLength);
+		cell.moveDat = moveDat = new DataView(moveU8.buffer);
+	}
 
-	move.writeUInt32LE(cell.id, 0);
-	move.writeInt16LE(cell.x, 4);
-	move.writeInt16LE(cell.y, 6);
-	move.writeUInt16LE(cell.r, 8);
+	moveDat.setUint32(0, cell.id, true);
+	moveDat.setInt16(4, cell.x, true);
+	moveDat.setInt16(6, cell.y, true);
+	moveDat.setUint16(8, cell.r, true);
 
 	let flags = 0;
 	if (cell.type === CELL_TYPE_VIRUS) flags |= 1;
 	if (cell.type === CELL_TYPE_EJECT) flags |= 0x20;
-	move.writeUInt8(flags, 10);
-	// move.writeUInt8(0, 11); // sigmally: isUpdate, this is never used
-	// move.writeUInt8(0, 12); // sigmally: isPlayer, this is never used
-	move.writeUInt8(cell.owner.sub ? 1 : 0, 13); // sigmally
+	moveU8[10] = flags;
+	// moveU8[11] = 0; // sigmally: isUpdate, this is never used
+	// moveU8[12] = 0; // sigmally: isPlayer, this is never used
+	moveU8[13] = cell.owner.sub ? 1 : 0; // sigmally
 
-	cell.owner.clan.copy(move, 14);
+	moveU8.set(cell.owner.clanU8, 14); // sigmally
 
-	let first = cell.encodingFirst;
-	const firstByteLength = moveByteLength + 3 + cell.owner.skin.byteLength + cell.owner.name.byteLength;
-	if (first.byteLength !== firstByteLength) cell.encodingFirst = first = Buffer.alloc(firstByteLength);
-	move.copy(first);
-	first.writeUInt8(flags | 0x02 | 0x04 | 0x08, 10); // add more flags (color, name, skin)
+	let { firstDat, firstU8 } = cell;
+	const firstByteLength = moveByteLength + 3 + cell.owner.skinU8.length + cell.owner.nameU8.length;
+	if (firstDat.byteLength !== firstByteLength) {
+		cell.firstU8 = firstU8 = new Uint8Array(firstByteLength);
+		cell.firstDat = firstDat = new DataView(firstU8.buffer);
+		cell.firstU8.set(moveU8);
+		cell.firstU8[10] |= 2 | 4 | 8; // add more flags (color, skin, name)
 
-	let o = move.byteLength;
-	first.writeUInt32LE(cell.rgb, o); // this will never overflow the bounds of `first`
-	o += 3;
-	cell.owner.skin.copy(first, o);
-	o += cell.owner.skin.byteLength;
-	cell.owner.name.copy(first, o);
-
-	cell.encodingMove = move;
-	cell.encodingFirst = first;
+		let o = moveU8.length;
+		(firstDat.setUint32(o, cell.rgb, true), o += 3);
+		(firstU8.set(cell.owner.skinU8, o), o += cell.owner.skinU8.length);
+		firstU8.set(cell.owner.nameU8, o);
+	} else {
+		firstDat.setInt16(4, cell.x, true);
+		firstDat.setInt16(6, cell.y, true);
+		firstDat.setUint16(8, cell.r, true);
+	}
 };
-
-const MINION_SPAWN = { name: encodeUtf8(settings.minionName), skin: EMPTY_STRING, spectating: false, sub: false };
 
 let lastLargestPlayerVisibleCells = new Set();
 const worldEatArray = [];
@@ -674,8 +682,8 @@ const worldTick = () => {
 				else if (player.spawn && player.state !== PLAYER_STATE_LIMBO) {
 					if (player.spawn.spectating) player.state = PLAYER_STATE_SPECTATE;
 					else {
-						player.name = player.spawn.name;
-						player.skin = player.spawn.skin;
+						player.nameU8 = player.spawn.nameU8;
+						player.skinU8 = player.spawn.skinU8;
 						player.sub = player.spawn.sub;
 						player.state = PLAYER_STATE_PLAYING;
 
@@ -774,18 +782,18 @@ const worldTick = () => {
 			players.add({
 				bot: false,
 				camera: { x: 0, y: 0, scale: 1 },
-				clan: EMPTY_STRING,
+				clanU8: EMPTY_STRING_U8,
 				disconnectedAt: 0,
 				lastW: 0,
 				minionCommander: player,
 				mouseX: 0,
 				mouseY: 0,
-				name: EMPTY_STRING,
+				nameU8: EMPTY_STRING_U8,
 				owned: new Set(),
 				rgb: 0x7f7f7f,
 				q: false,
 				showClanmates: false,
-				skin: EMPTY_STRING,
+				skinU8: EMPTY_STRING_U8,
 				spawn: undefined,
 				splits: 0,
 				state: PLAYER_STATE_IDLE,
@@ -810,18 +818,18 @@ const worldTick = () => {
 		players.add({
 			bot: true,
 			camera: { x: 0, y: 0, scale: 1 },
-			clan: EMPTY_STRING,
+			clanU8: EMPTY_STRING_U8,
 			disconnectedAt: 0,
 			minionCommander: undefined,
 			mouseX: 0,
 			mouseY: 0,
 			lastW: 0,
-			name: EMPTY_STRING,
+			nameU8: EMPTY_STRING_U8,
 			owned: new Set(),
 			rgb: 0x7f7f7f,
 			q: false,
 			showClanmates: false,
-			skin: EMPTY_STRING,
+			skinU8: EMPTY_STRING_U8,
 			spawn: undefined,
 			splits: 0,
 			state: PLAYER_STATE_IDLE,
@@ -837,7 +845,7 @@ const worldTick = () => {
 	// compile statistics
 	let avgTickTime = 0;
 	for (const frame of tickTimes) avgTickTime += frame.time;
-	statsBuffer = Buffer.concat([Buffer.from([0xfe]), Buffer.from(JSON.stringify({
+	const statsU8Partial = textEncoder.encode(JSON.stringify({
 		limit: settings.listenerMaxConnections,
 		internal: playingInternal, // might be outdated by one tick, but that's okay
 		external: playingExternal + spectating + idling,
@@ -854,7 +862,10 @@ const worldTick = () => {
 		playersAlive: playingExternal,
 		playersSpect: spectating,
 		playersLimit: settings.listenerMaxConnections,
-	}))]);
+	}));
+	statsU8 = new Uint8Array(statsU8Partial.length + 1);
+	statsU8[0] = 0xfe;
+	statsU8.set(statsU8Partial, 1);
 
 	// #2 update connections
 	const newVisibleCells = new Map();
@@ -926,20 +937,20 @@ const worldTick = () => {
 		// leaderboard (must be recomputed for every player, because of "myPosition")
 		let o = 0;
 		if (now % 4 === 0) {
-			writer.writeUInt8(0x31, o++);
+			writerU8[o++] = 0x31;
 			const length = Math.min(leaderboard.length, 10);
 			const myPosition = leaderboard.findIndex(entry => entry.player === player) || 0; // 0 if not found
 
-			(writer.writeUInt32LE(length, o), o += 4);
+			(writerDat.setUint32(o, length, true), o += 4);
 			for (let i = 0; i < length; ++i) {
 				const { player: lbPlayer } = leaderboard[i];
-				(writer.writeUInt32LE(lbPlayer === player ? 1 : 0, o), o += 4);
-				(lbPlayer.name.copy(writer, o), o += lbPlayer.name.byteLength);
-				(writer.writeUInt32LE(myPosition + 1, o), o += 4);
-				(writer.writeUInt32LE(lbPlayer.sub ? 1 : 0, o), o += 4);
+				(writerDat.setUint32(o, lbPlayer === player ? 1 : 0, true), o += 4);
+				(writerU8.set(lbPlayer.nameU8, o), o += lbPlayer.nameU8.length);
+				(writerDat.setUint32(o, myPosition + 1, true), o += 4); // sigmally
+				(writerDat.setUint32(o, lbPlayer.sub ? 1 : 0, true), o += 4); // sigmally
 			}
 
-			player.ws.send(writer.subarray(0, o));
+			player.ws.send(writerU8.subarray(0, o));
 		}
 
 		// the new Set.prototype.difference and .intersection functions are only faster if the two sets are very
@@ -953,10 +964,10 @@ const worldTick = () => {
 		const del = worldPacketDelArray;
 		for (const cell of visibleCells) {
 			if (oldVisibleCells.has(cell)) {
-				if (cell.moved === now) upd[updL++] = cell.encodingMove;
+				if (cell.moved === now) upd[updL++] = cell.moveU8;
 			} else {
 				if (cell.owner === player) newOwned.push(cell.id);
-				add[addL++] = cell.encodingFirst;
+				add[addL++] = cell.firstU8;
 			}
 		}
 		for (const cell of oldVisibleCells) {
@@ -965,45 +976,39 @@ const worldTick = () => {
 			else del[delL++] = cell; // sigmally: non-sigmally clients require the cell to be in both eat and del
 		}
 
-		for (let i = 0; i < newOwned.length; ++i) {
-			writer.writeUInt8(0x20, 0);
-			writer.writeUInt32LE(newOwned[i], 1);
-			player.ws.send(writer.subarray(0, 5));
+		if (newOwned.length) {
+			writerU8[0] = 0x20;
+			for (let i = 0; i < newOwned.length; ++i) {
+				writerDat.setUint32(1, newOwned[i], true);
+				player.ws.send(writerU8.subarray(0, 5));
+			}
 		}
 
 		if (player.state === PLAYER_STATE_ROAM || player.state === PLAYER_STATE_SPECTATE) {
-			writer.writeUInt8(0x11, 0);
-			writer.writeFloatLE(player.camera.x, 1);
-			writer.writeFloatLE(player.camera.y, 5);
-			writer.writeFloatLE(player.camera.scale, 9);
-			player.ws.send(writer.subarray(0, 13));
+			writerU8[0] = 0x11;
+			writerDat.setFloat32(1, player.camera.x, true);
+			writerDat.setFloat32(5, player.camera.y, true);
+			writerDat.setFloat32(9, player.camera.scale, true);
+			player.ws.send(writerU8.subarray(0, 13));
 		}
 
+		// update packet
 		o = 0;
-		writer.writeUInt8(0x10, o++); // packet: update
-
-		(writer.writeUInt16LE(eatL, o), o += 2);
+		writerU8[o++] = 0x10;
+		(writerDat.setUint16(o, eatL, true), o += 2);
 		for (let i = 0; i < eatL; ++i) {
-			(writer.writeUInt32LE(eat[i].deadTo, o), o += 4);
-			(writer.writeUInt32LE(eat[i].id, o), o += 4);
+			(writerDat.setUint32(o, eat[i].deadTo, true), o += 4);
+			(writerDat.setUint32(o, eat[i].id, true), o += 4);
 		}
 
-		for (let i = 0; i < addL; ++i) {
-			add[i].copy(writer, o);
-			o += add[i].byteLength;
-		}
-		for (let i = 0; i < updL; ++i) {
-			upd[i].copy(writer, o);
-			o += upd[i].byteLength;
-		}
-		(writer.writeUInt32LE(0, o), o += 4);
+		for (let i = 0; i < addL; ++i) (writerU8.set(add[i], o), o += add[i].length);
+		for (let i = 0; i < updL; ++i) (writerU8.set(upd[i], o), o += upd[i].length);
+		(writerDat.setUint32(o, 0, true), o += 4);
 
-		(writer.writeUInt16LE(delL, o), o += 2);
-		for (let i = 0; i < delL; ++i) {
-			(writer.writeUInt32LE(del[i].id, o), o += 4);
-		}
+		(writerDat.setUint16(o, delL, true), o += 2);
+		for (let i = 0; i < delL; ++i) (writerDat.setUint32(o, del[i].id, true), o += 4);
 
-		player.ws.send(writer.subarray(0, o));
+		player.ws.send(writerU8.subarray(0, o));
 
 		if (eatL > maxEatL) maxEatL = eatL;
 		if (addL > maxAddL) maxAddL = addL;
@@ -1034,8 +1039,8 @@ const worldTick = () => {
 
 		if (player.state !== PLAYER_STATE_PLAYING) {
 			player.spawn = {
-				name: PLAYER_BOT_NAMES[~~(Math.random() * PLAYER_BOT_NAMES.length)],
-				skin: PLAYER_BOT_SKINS[~~(Math.random() * PLAYER_BOT_SKINS.length)],
+				nameU8: PLAYER_BOT_NAMES_U8[~~(Math.random() * PLAYER_BOT_NAMES_U8.length)],
+				skinU8: PLAYER_BOT_SKINS_U8[~~(Math.random() * PLAYER_BOT_SKINS_U8.length)],
 				spectating: false,
 				sub: false,
 			};
@@ -1136,33 +1141,32 @@ worldTick();
 
 //========== networking ================================================================================================
 
-const SIG_VERSION_STRING = Buffer.from('SIG 0.0.1\0');
+const SIG_VERSION_STRING_U8 = textEncoder.encode('SIG 0.0.1\0');
 // SIG 0.0.1\0, then integers 0-255 (don't bother with opcode shuffling)
-const SIG_HANDSHAKE = Buffer.alloc(SIG_VERSION_STRING.byteLength + 256);
-SIG_VERSION_STRING.copy(SIG_HANDSHAKE);
-for (let i = 0, o = SIG_VERSION_STRING.byteLength; i < 256; ++i, ++o) {
-	SIG_HANDSHAKE.writeUInt8(i, o);
-}
+const SIG_HANDSHAKE_U8 = new Uint8Array(SIG_VERSION_STRING_U8.length + 256);
+SIG_HANDSHAKE_U8.set(SIG_VERSION_STRING_U8);
+for (let i = 0, o = SIG_VERSION_STRING_U8.length; i < 256; ++i, ++o) SIG_HANDSHAKE_U8[o] = i;
 
-const BORDER_UPDATE_PACKET = Buffer.alloc(33);
-BORDER_UPDATE_PACKET.writeUInt8(0x40, 0);
-BORDER_UPDATE_PACKET.writeDoubleLE(-settings.worldMapW, 1);
-BORDER_UPDATE_PACKET.writeDoubleLE(-settings.worldMapH, 9);
-BORDER_UPDATE_PACKET.writeDoubleLE(settings.worldMapW, 17);
-BORDER_UPDATE_PACKET.writeDoubleLE(settings.worldMapH, 25);
+const BORDER_UPDATE_PACKET_DAT = new DataView(new ArrayBuffer(33));
+BORDER_UPDATE_PACKET_DAT.setUint8(0, 0x40);
+BORDER_UPDATE_PACKET_DAT.setFloat64(1, -settings.worldMapW, true);
+BORDER_UPDATE_PACKET_DAT.setFloat64(9, -settings.worldMapH, true);
+BORDER_UPDATE_PACKET_DAT.setFloat64(17, settings.worldMapW, true);
+BORDER_UPDATE_PACKET_DAT.setFloat64(25, settings.worldMapH, true);
+const BORDER_UPDATE_PACKET_U8 = new Uint8Array(BORDER_UPDATE_PACKET_DAT.buffer);
 
-const SERVER_NAME = encodeUtf8('Server');
-const SPECTATOR_NAME = encodeUtf8('Spectator');
+const SERVER_NAME_U8 = encodeUtf8AsU8('Server');
+const SPECTATOR_NAME_U8 = encodeUtf8AsU8('Spectator');
 // caching utf8 probably is not that necessary, but it's cool, so why not
 const serverMessageCache = [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15].map(x => undefined);
-const messagePacket = (flags, color, name, message) => {
+const messagePacketU8 = (flags, color, nameU8, messageU8) => {
 	let o = 0;
-	writer.writeUInt8(0x63, o++); // chat opcode
-	writer.writeUInt8(flags, o++);
-	(writer.writeUInt32LE(color, o), o += 3);
-	(name.copy(writer, o), o += name.byteLength);
-	(message.copy(writer, o), o += message.byteLength);
-	return writer.subarray(0, o);
+	writerU8[o++] = 0x63; // chat opcode
+	writerU8[o++] = flags;
+	(writerDat.setUint32(o, color, true), o += 3);
+	(writerU8.set(nameU8, o), o += nameU8.length);
+	(writerU8.set(messageU8, o), o += messageU8.length);
+	return writerU8.subarray(0, o);
 };
 
 let cliChatMuted = false;
@@ -1182,27 +1186,32 @@ wss.on('connection', client => {
 	});
 	client.on('error', () => {});
 	client.on('message', buf => {
+		const dat = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+		const u8 = new Uint8Array(dat.buffer, dat.byteOffset, dat.byteLength);
 		// data must always be a Buffer, even though ws module is very ambiguous
-		if (buf.byteLength >= 512 || !buf.byteLength) return client.close(1009, 'Unexpected message size');
+		if (dat.byteLength >= 512 || !dat.byteLength) return client.close(1009, 'Unexpected message size');
 		if (!player) {
-			if (!buf.equals(SIG_VERSION_STRING)) client.close(1003, 'Ambiguous protocol');
+			if (u8.length !== SIG_VERSION_STRING_U8.length) return client.close(1003, 'Ambiguous protocol');
+			for (let i = 0; i < u8.length; ++i) {
+				if (u8[i] !== SIG_VERSION_STRING_U8[i]) return client.close(1003, 'Ambiguous protocol');
+			}
 
 			player = {
 				bot: false,
 				camera: { x: 0, y: 0, scale: 1 },
 				chatAt: now,
-				clan: EMPTY_STRING,
+				clanU8: EMPTY_STRING_U8,
 				disconnectedAt: 0,
 				lastW: 0,
 				minionCommander: undefined,
 				mouseX: 0,
 				mouseY: 0,
-				name: EMPTY_STRING,
+				nameU8: EMPTY_STRING_U8,
 				owned: new Set(),
 				q: false,
 				rgb: 0x7f7f7f,
 				showClanmates: false,
-				skin: EMPTY_STRING,
+				skinU8: EMPTY_STRING_U8,
 				spawn: undefined,
 				splits: 0,
 				state: PLAYER_STATE_IDLE,
@@ -1214,8 +1223,8 @@ wss.on('connection', client => {
 			};
 			players.add(player);
 
-			client.send(SIG_HANDSHAKE);
-			client.send(BORDER_UPDATE_PACKET);
+			client.send(SIG_HANDSHAKE_U8);
+			client.send(BORDER_UPDATE_PACKET_U8);
 			return;
 		}
 
@@ -1224,10 +1233,10 @@ wss.on('connection', client => {
 		let o = 0;
 		const readUtf8 = () => { // null-terminated utf8 string
 			let start = o;
-			while (o < buf.byteLength && buf.readUInt8(o)) ++o;
-			return buf.subarray(start, o).toString('utf8');
+			while (o < u8.length && u8[o]) ++o;
+			return textDecoder.decode(u8.subarray(start, o));
 		};
-		const opcode = buf.readUInt8(o++);
+		const opcode = u8[o++];
 		if (opcode === 0) {
 			let body;
 			try {
@@ -1242,42 +1251,42 @@ wss.on('connection', client => {
 
 			const spectating = body.state ==/*=*/ 2;
 			if (!spectating && settings.serverPassword && settings.serverPassword !== body.password) {
-				client.send(Buffer.from([ 0xb4 ])); // password prompt
+				client.send(new Uint8Array([ 0xb4 ])); // password prompt
 				return;
 			}
 
 			player.spawn = {
-				name: encodeUtf8(body.name.substring(0, 64)),
-				skin: encodeUtf8((body.skin || '').substring(0, 20)), // low limit, to prevent accessing things that aren't skins
+				nameU8: encodeUtf8AsU8(body.name.substring(0, 64)),
+				skinU8: encodeUtf8AsU8((body.skin || '').substring(0, 20)), // low limit, to prevent accessing things that aren't skins
 				spectating,
 				sub: !!body.sub,
 			};
-			player.clan = encodeUtf8((body.clan || '').substring(0, 32));
+			player.clan = encodeUtf8AsU8((body.clan || '').substring(0, 32));
 			player.showClanmates = !!body.showClanmates;
 		} else if (opcode === 0x10) {
-			if (buf.byteLength === 13) {
-				player.mouseX = buf.readInt32LE(o);
-				player.mouseY = buf.readInt32LE(o + 4);
-			} else if (buf.byteLength === 9) { // no one actually uses this but it's supported
-				player.mouseX = buf.readInt16LE(o);
-				player.mouseY = buf.readInt16LE(o + 2);
-			} else if (buf.byteLength === 21) {
-				player.mouseX = ~~buf.readDoubleLE(o);
-				player.mouseY = ~~buf.readDoubleLE(o + 8);
+			if (dat.byteLength === 13) {
+				player.mouseX = dat.getInt32(o, true);
+				player.mouseY = dat.getInt32(o + 4, true);
+			} else if (dat.byteLength === 9) { // no one actually uses this but it's supported
+				player.mouseX = buf.getInt16(o, true);
+				player.mouseY = buf.getInt16(o + 2, true);
+			} else if (dat.byteLength === 21) {
+				player.mouseX = ~~buf.getFloat64(o, true);
+				player.mouseY = ~~buf.getFloat64(o + 8, true);
 			} else client.close(1003, 'Unexpected message format');
 		} else if (opcode === 0x11) ++player.splits;
 		else if (opcode === 0x12) player.q = true;
 		else if (opcode === 0x13) player.q = false;
 		else if (opcode === 0x15) player.w = true;
 		else if (opcode === 0x63) {
-			if (buf.byteLength < 2) return client.close(1003, 'Bad message format');
+			if (dat.byteLength < 2) return client.close(1003, 'Bad message format');
 			++o; // skip flags altogether
 			const message = readUtf8().trim();
 			if (message[0] === '/' && message.length >= 2) {
 				let [command, ...args] = message.split(' ');
 				command = command.toLowerCase();
 				const serverMessage = (cacheId, msg) => {
-					client.send(messagePacket(0x80, 0xc03f3f, SERVER_NAME, serverMessageCache[cacheId] ??= encodeUtf8(msg)));
+					client.send(messagePacketU8(0x80, 0xc03f3f, SERVER_NAME_U8, serverMessageCache[cacheId] ??= encodeUtf8AsU8(msg)));
 				}
 				if (command === '/help') {
 					serverMessage(0, 'available commands:');
@@ -1320,7 +1329,7 @@ wss.on('connection', client => {
 					}
 					boostingCells.length = j;
 
-					client.send(Buffer.from([0x12])); // world reset
+					client.send(new Uint8Array([0x12])); // world reset
 				} else if (command === '/joinworld') {
 					// just assume the argument is 1
 					if (player.state !== PLAYER_STATE_LIMBO) return serverMessage(10, 'you\'re already in a world');
@@ -1335,22 +1344,23 @@ wss.on('connection', client => {
 			if (now - player.chatAt < 5) return; // no cooldown on commands (respawns), but slow down chats
 			player.chatAt = now;
 			const trimmed = message.substring(0, 32);
-			const packet = messagePacket(
+			const packet = messagePacketU8(
 				0,
 				player.rgb,
-				player.name === EMPTY_STRING ? SPECTATOR_NAME : player.name,
-				encodeUtf8(trimmed),
+				player.nameU8 === EMPTY_STRING_U8 ? SPECTATOR_NAME : player.nameU8,
+				encodeUtf8AsU8(trimmed),
 			);
 			for (const otherPlayer of players) {
 				if (otherPlayer.bot || otherPlayer.minionCommander) continue;
 				if (otherPlayer.state !== PLAYER_STATE_LIMBO && otherPlayer.ws.readyState === 1)
 					otherPlayer.ws.send(packet);
 			}
-			if (!cliChatMuted) console.log(`  [${player.name}] ${trimmed}`);
+			// TODO there should be a better way to print chat messages
+			if (!cliChatMuted) console.log(`  [${textDecoder.decode(player.nameU8)}] ${trimmed}`);
 		} else if (opcode === 0xfe) {
 			// stats
 			if (player.state === PLAYER_STATE_LIMBO) return;
-			client.send(statsBuffer);
+			client.send(statsU8);
 		}
 	});
 });
@@ -1402,7 +1412,8 @@ const ask = input => {
 					mass += cell.r * cell.r / 100;
 				}
 
-				console.log(`- ${stateName} - ${~~mass} mass - ${player.name}`);
+				// TODO should not be decoding text all the time
+				console.log(`- ${stateName} - ${~~mass} mass - ${textDecoder.decode(player.nameU8)}`);
 			}
 		} else if (command === 'safeexit') {
 			console.log('server will be exited once all players leave');
@@ -1415,7 +1426,7 @@ const ask = input => {
 			}, 5000);
 		} else if (command === 'say') {
 			// no sever flag, otherwise it gets duplicated between sigfixes tabs
-			const packet = messagePacket(0, 0xc03f3f, SERVER_NAME, encodeUtf8(args.join(' ')));
+			const packet = messagePacketU8(0x80, 0xc03f3f, SERVER_NAME_U8, encodeUtf8AsU8(args.join(' ')));
 			for (const player of players) {
 				if (player.bot || player.minionCommander) continue;
 				if (player.state !== PLAYER_STATE_LIMBO && player.ws.readyState === 1) player.ws.send(packet);
