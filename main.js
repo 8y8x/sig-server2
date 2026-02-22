@@ -1590,3 +1590,7 @@ setInterval(() => {
 }, 15_000);
 
 console.log(`server started in ${performance.now().toFixed(1)}ms`);
+
+process.on('uncaughtException', (err, origin) => {
+	log.write(`${new Date().toISOString()} | uncaughtException:\nerr: ${err}\norigin: ${origin}`);
+});
