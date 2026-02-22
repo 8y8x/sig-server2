@@ -132,7 +132,8 @@ const SQRT2 = Math.sqrt(2);
 const WORLD_EAT_MULT = Math.sqrt(1.3); // must be 30% bigger in mass to eat a cell
 const WORLD_EAT_OVERLAP_MULT = 1 / 3;
 
-const tickTimes = [];
+const metricsPointsLabels = [];
+const metricsMeasurements = [];
 
 const boostingCells = [];
 const playerCells = [];
@@ -314,7 +315,14 @@ const worldTick = () => {
 	const start = performance.now();
 
 	// #1 update world
-	const tickMetrics = {};
+	const framePoints = [];
+	let lastPoint = start;
+	const tickMeasurement = label => {
+		metricsPointsLabels[framePoints.length] = label;
+		const now = performance.now();
+		framePoints.push(now - lastPoint);
+		lastPoint = now;
+	};
 
 	if (nextCellId >= 4e9) nextCellId = 1;
 
@@ -431,7 +439,7 @@ const worldTick = () => {
 		});
 	}
 
-	tickMetrics.cells1 = performance.now() - start;
+	tickMeasurement('cells1');
 
 	for (let i = 0; i < rigidL; i += 2) {
 		const a = rigid[i];
@@ -573,7 +581,7 @@ const worldTick = () => {
 	}
 	playerCells.length = j;
 
-	tickMetrics.cells2 = performance.now() - start - tickMetrics.cells1;
+	tickMeasurement('cells2');
 
 	// now update players
 	// compile leaderboard, or at least find the largest player
@@ -581,6 +589,7 @@ const worldTick = () => {
 	let largestPlayer, largestPlayerMass = 0;
 	if (now % 4 === 0) {
 		for (const player of players) {
+			if (player.minionCommander) continue;
 			let mass = 0;
 			for (const cell of player.owned) {
 				mass += cell.r * cell.r;
@@ -592,11 +601,14 @@ const worldTick = () => {
 		largestPlayerMass = leaderboard[0]?.mass || 0;
 	} else {
 		for (const player of players) {
+			if (player.minionCommander) continue;
 			let mass = 0;
 			for (const cell of player.owned) mass += cell.r * cell.r;
 			if (mass > largestPlayerMass) [largestPlayer, largestPlayerMass] = [player, mass];
 		}
 	}
+
+	tickMeasurement('cells3');
 
 	for (const player of players) {
 		if (player.disconnectedAt) {
@@ -838,11 +850,11 @@ const worldTick = () => {
 		});
 	}
 
-	tickMetrics.cells3 = performance.now() - start - tickMetrics.cells2;
+	tickMeasurement('cells4');
 
 	// compile statistics
 	let avgTickTime = 0;
-	for (const frame of tickTimes) avgTickTime += frame.time;
+	for (const frame of metricsMeasurements) avgTickTime += frame.time;
 	const statsU8Partial = textEncoder.encode(JSON.stringify({
 		limit: settings.listenerMaxConnections,
 		internal: playingInternal, // might be outdated by one tick, but that's okay
@@ -851,11 +863,11 @@ const worldTick = () => {
 		spectating,
 		name: settings.serverName,
 		gamemode: settings.serverGamemode,
-		loadTime: avgTickTime / tickTimes.length,
+		loadTime: avgTickTime / metricsMeasurements.length,
 		uptime: ~~(performance.now() / 1000),
 		// legacy
 		mode: settings.serverGamemode,
-		update: avgTickTime / tickTimes.length,
+		update: avgTickTime / metricsMeasurements.length,
 		playersTotal: playingExternal + spectating,
 		playersAlive: playingExternal,
 		playersSpect: spectating,
@@ -920,7 +932,7 @@ const worldTick = () => {
 		newVisibleCells.set(player.camera, visibleCells);
 	}
 
-	tickMetrics.con1 = performance.now() - start - tickMetrics.cells3;
+	tickMeasurement('con1');
 
 	let maxEatL = 0, maxAddL = 0, maxUpdL = 0, maxDelL = 0;
 	con2PlayerLoop: for (const player of players) {
@@ -1024,7 +1036,7 @@ const worldTick = () => {
 	worldPacketUpdArray.fill(undefined, 0, maxUpdL);
 	worldPacketDelArray.fill(undefined, 0, maxDelL);
 
-	tickMetrics.con2 = performance.now() - start - tickMetrics.con1;
+	tickMeasurement('con2');
 
 	for (const player of players) {
 		if (!player.bot || player.disconnectedAt) continue;
@@ -1129,15 +1141,15 @@ const worldTick = () => {
 		}
 	}
 
-	tickMetrics.con3 = performance.now() - start - tickMetrics.con2;
+	tickMeasurement('con3');
 
 	// #3 update matchmaker
 	// #4 update gamemode-specific
 
-	tickMetrics.time = performance.now() - start;
-	tickTimes[now % 25] = tickMetrics;
+	const elapsed = performance.now() - start;
+	metricsMeasurements[now % 100] = { points: framePoints, time: elapsed };
 	++now;
-	setTimeout(worldTick, Math.max(40 - tickMetrics.time, 0));
+	setTimeout(worldTick, Math.max(40 - elapsed, 0));
 };
 worldTick();
 
@@ -1473,24 +1485,18 @@ const ask = input => {
 			const path = require('v8').writeHeapSnapshot();
 			console.log(`written in ${(performance.now() - start).toFixed(2)} ms to ${path}`);
 		} else if (command === 'stats') {
-			let avgCells1 = 0, avgCells2 = 0, avgCells3 = 0, avgCon1 = 0, avgCon2 = 0, avgCon3 = 0;
+			const averages = [];
 			let avgTickTime = 0;
-			for (const frame of tickTimes) {
-				avgCells1 += frame.cells1;
-				avgCells2 += frame.cells2;
-				avgCells3 += frame.cells3;
-				avgCon1 += frame.con1;
-				avgCon2 += frame.con2;
-				avgCon3 += frame.con3;
+			for (const frame of metricsMeasurements) {
+				for (let i = 0; i < frame.points.length; ++i) {
+					averages[i] = (averages[i] ?? 0) + frame.points[i];
+				}
 				avgTickTime += frame.time;
 			}
 			console.log(`load:   ${(avgTickTime / 25).toFixed(2)} ms / 40 ms (${(avgTickTime / 25 * 2.5).toFixed(2)}%)`);
-			console.log(`     -> ${(avgCells1 / 25).toFixed(2)} ms (cells1)`);
-			console.log(`     -> ${(avgCells2 / 25).toFixed(2)} ms (cells2)`);
-			console.log(`     -> ${(avgCells3 / 25).toFixed(2)} ms (cells3)`);
-			console.log(`     -> ${(avgCon1 / 25).toFixed(2)} ms (con1, update visible cells)`);
-			console.log(`     -> ${(avgCon2 / 25).toFixed(2)} ms (con2, create packets)`);
-			console.log(`     -> ${(avgCon3 / 25).toFixed(2)} ms (con3, update player bots)`);
+			for (let i = 0; i < metricsPointsLabels.length; ++i) {
+				console.log(`     -> ${(averages[i] / metricsMeasurements.length).toFixed(2)} ms (${metricsPointsLabels[i]})`);
+			}
 
 			const memory = process.memoryUsage();
 			const pretty = value => {
@@ -1539,15 +1545,12 @@ commandStream.question('@ ', ask);
 
 const log = fs.createWriteStream(`log-${new Date().toISOString()}.txt`);
 setInterval(() => {
-	let avgCells1 = 0, avgCells2 = 0, avgCells3 = 0, avgCon1 = 0, avgCon2 = 0, avgCon3 = 0;
+	const averages = [];
 	let avgTickTime = 0;
-	for (const frame of tickTimes) {
-		avgCells1 += frame.cells1;
-		avgCells2 += frame.cells2;
-		avgCells3 += frame.cells3;
-		avgCon1 += frame.con1;
-		avgCon2 += frame.con2;
-		avgCon3 += frame.con3;
+	for (const frame of metricsMeasurements) {
+		for (let i = 0; i < frame.points.length; ++i) {
+			averages[i] = (averages[i] ?? 0) + frame.points[i];
+		}
 		avgTickTime += frame.time;
 	}
 	let realPellets = 0, realViruses = 0, realEjects = 0, realPlayerCells = 0, realCells = 0;
@@ -1566,7 +1569,7 @@ setInterval(() => {
 		else if (player.state === PLAYER_STATE_PLAYING) ++playing;
 		else ++idle;
 	}
-	log.write(`${new Date().toISOString()} | ${(avgCells1 / 25).toFixed(2)} -> ${(avgCells2 / 25).toFixed(2)} -> ${(avgCells3 / 25).toFixed(2)} -> ${(avgCon1 / 25).toFixed(2)} -> ${(avgCon2 / 25).toFixed(2)} -> ${(avgCon3 / 25).toFixed(2)} (${(avgTickTime / 25 * 2.5).toFixed(1)}% load) | ${playing} playing, ${spectating} spectating, ${idle} idle, ${minions} minions, ${bots} bots | ${realPellets}(${pellets}) pellets, ${realViruses}(${viruses}), ${realEjects} ejects, ${realPlayerCells} player cells, ${realCells} total cells\n`);
+	log.write(`${new Date().toISOString()} | ${averages.map(x => (x / metricsMeasurements.length).toFixed(2)).join(' -> ')} (${(avgTickTime / 25 * 2.5).toFixed(1)}% load) | ${playing} playing, ${spectating} spectating, ${idle} idle, ${minions} minions, ${bots} bots | ${realPellets}(${pellets}) pellets, ${realViruses}(${viruses}), ${realEjects} ejects, ${realPlayerCells} player cells, ${realCells} total cells\n`);
 }, 15_000);
 
 console.log(`server started in ${performance.now().toFixed(1)}ms`);
