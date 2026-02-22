@@ -138,6 +138,7 @@ const boostingCells = [];
 const playerCells = [];
 const players = new Set();
 const playerBotAi = new WeakMap();
+let connections = 0;
 let nextCellId = 1;
 let now = 0; // current tick
 let pellets = 0;
@@ -743,12 +744,10 @@ const worldTick = () => {
 	let playingExternal = 0;
 	let playingInternal = 0;
 	let spectating = 0;
-	let idling = 0;
 	for (const player of players) {
 		if (player.minionCommander || player.bot) ++playingInternal;
 		else if (player.state === PLAYER_STATE_PLAYING) ++playingExternal;
 		else if (player.state === PLAYER_STATE_ROAM || player.state === PLAYER_STATE_SPECTATE) ++spectating;
-		else ++idling;
 	}
 
 	// now, update minions
@@ -847,7 +846,7 @@ const worldTick = () => {
 	const statsU8Partial = textEncoder.encode(JSON.stringify({
 		limit: settings.listenerMaxConnections,
 		internal: playingInternal, // might be outdated by one tick, but that's okay
-		external: playingExternal + spectating + idling,
+		external: connections,
 		playing: playingExternal,
 		spectating,
 		name: settings.serverName,
@@ -984,7 +983,6 @@ const worldTick = () => {
 			for (let i = 0; i < newOwned.length; ++i) {
 				writerDat.setUint32(1, newOwned[i], true);
 				if (player.ws.send(writerU8.subarray(0, 5), true) !== 1) {
-					console.warn('backpressure on newOwned', player.ws.getBufferedAmount());
 					continue con2PlayerLoop;
 				}
 			}
@@ -1017,8 +1015,6 @@ const worldTick = () => {
 		if (player.ws.send(writerU8.subarray(0, o), true) === 1) {
 			// only update visible cells if there is no backpressure
 			player.visibleCells = visibleCells;
-		} else {
-			console.warn('backpressure on visible cells', player.ws.getBufferedAmount());
 		}
 	}
 
@@ -1180,13 +1176,25 @@ let cliChatMuted = false;
 uws.App()
 	.ws('/*', {
 		idleTimeout: 60,
-		maxBackpressure: 64 * 1024, // TODO: try with supremely low values
+		maxBackpressure: 64 * 1024,
 		maxPayloadLength: 512,
 		sendPingsAutomatically: false,
+		upgrade: (res, req, context) => {
+			// early destroy, before upgrading the connection
+			if (connections > settings.listenerMaxConnections) res.close();
+			else {
+				res.upgrade({},
+					req.getHeader('sec-websocket-key'),
+					req.getHeader('sec-websocket-protocol'),
+					req.getHeader('sec-websocket-extensions'),
+					context);
+			}
+		},
 		open: client => {
-			console.log('new client connected');
+			if (++connections > settings.listenerMaxConnections) client.close();
 		},
 		close: client => {
+			--connections;
 			const player = client.getUserData().player;
 			if (player) {
 				player.disconnectedAt = now;
@@ -1610,7 +1618,7 @@ const ask = input => {
 				let stateName;
 				if (player.state === PLAYER_STATE_IDLE) stateName = '----';
 				else if (player.state === PLAYER_STATE_PLAYING) stateName = 'play';
-				else if (player.sate === PLAYER_STATE_ROAM) stateName = 'roam';
+				else if (player.state === PLAYER_STATE_ROAM) stateName = 'roam';
 				else if (player.state === PLAYER_STATE_SPECTATE) stateName = 'spec';
 				else stateName = 'xxxx';
 
