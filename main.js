@@ -2,10 +2,9 @@
 
 const fs = require('node:fs');
 const readline = require('node:readline');
-const { WebSocketServer } = require('ws');
+const uws = require('uWebSockets.js');
 
 const settings = require('./settings.json');
-const serverStartTime = performance.now(); // probably 0 most of the time, but i don't want to risk it
 
 const textDecoder = new TextDecoder();
 const textEncoder = new TextEncoder();
@@ -393,7 +392,7 @@ const worldTick = () => {
 
 		if (cell.r > settings.playerMaxSize) {
 			const overflow = Math.ceil(cell.r * cell.r / (settings.playerMaxSize * settings.playerMaxSize));
-			const splitCellCount = Math.min(overflow, settings.playerMaxCells - cell.owner.owned.size);
+			const splitCellCount = Math.max(Math.min(overflow, settings.playerMaxCells - cell.owner.owned.size), 0);
 			const splitSize = Math.min(Math.sqrt(cell.r * cell.r / splitCellCount), settings.playerMaxSize);
 			for (let i = 1; i < splitCellCount; ++i) {
 				const angle = Math.random() * 2 * Math.PI;
@@ -854,7 +853,7 @@ const worldTick = () => {
 		name: settings.serverName,
 		gamemode: settings.serverGamemode,
 		loadTime: avgTickTime / tickTimes.length,
-		uptime: ~~((performance.now() - serverStartTime) / 1000),
+		uptime: ~~(performance.now() / 1000),
 		// legacy
 		mode: settings.serverGamemode,
 		update: avgTickTime / tickTimes.length,
@@ -925,14 +924,13 @@ const worldTick = () => {
 	tickMetrics.con1 = performance.now() - start - tickMetrics.cells3;
 
 	let maxEatL = 0, maxAddL = 0, maxUpdL = 0, maxDelL = 0;
-	for (const player of players) {
+	con2PlayerLoop: for (const player of players) {
 		if (player.disconnectedAt || player.minionCommander || player.bot) continue;
 
 		const visibleCells = newVisibleCells.get(player.camera);
 		if (!visibleCells) continue; // could happen if the player was just in limbo
 
 		const oldVisibleCells = player.visibleCells;
-		player.visibleCells = visibleCells;
 
 		// leaderboard (must be recomputed for every player, because of "myPosition")
 		let o = 0;
@@ -950,7 +948,7 @@ const worldTick = () => {
 				(writerDat.setUint32(o, lbPlayer.sub ? 1 : 0, true), o += 4); // sigmally
 			}
 
-			player.ws.send(writerU8.subarray(0, o));
+			void player.ws.send(writerU8.subarray(0, o), true);
 		}
 
 		// the new Set.prototype.difference and .intersection functions are only faster if the two sets are very
@@ -976,11 +974,19 @@ const worldTick = () => {
 			else del[delL++] = cell; // sigmally: non-sigmally clients require the cell to be in both eat and del
 		}
 
+		if (eatL > maxEatL) maxEatL = eatL;
+		if (addL > maxAddL) maxAddL = addL;
+		if (updL > maxUpdL) maxUpdL = updL;
+		if (delL > maxDelL) maxDelL = delL;
+
 		if (newOwned.length) {
 			writerU8[0] = 0x20;
 			for (let i = 0; i < newOwned.length; ++i) {
 				writerDat.setUint32(1, newOwned[i], true);
-				player.ws.send(writerU8.subarray(0, 5));
+				if (player.ws.send(writerU8.subarray(0, 5), true) !== 1) {
+					console.warn('backpressure on newOwned', player.ws.getBufferedAmount());
+					continue con2PlayerLoop;
+				}
 			}
 		}
 
@@ -989,7 +995,7 @@ const worldTick = () => {
 			writerDat.setFloat32(1, player.camera.x, true);
 			writerDat.setFloat32(5, player.camera.y, true);
 			writerDat.setFloat32(9, player.camera.scale, true);
-			player.ws.send(writerU8.subarray(0, 13));
+			void player.ws.send(writerU8.subarray(0, 13), true);
 		}
 
 		// update packet
@@ -1008,12 +1014,12 @@ const worldTick = () => {
 		(writerDat.setUint16(o, delL, true), o += 2);
 		for (let i = 0; i < delL; ++i) (writerDat.setUint32(o, del[i].id, true), o += 4);
 
-		player.ws.send(writerU8.subarray(0, o));
-
-		if (eatL > maxEatL) maxEatL = eatL;
-		if (addL > maxAddL) maxAddL = addL;
-		if (updL > maxUpdL) maxUpdL = updL;
-		if (delL > maxDelL) maxDelL = delL;
+		if (player.ws.send(writerU8.subarray(0, o), true) === 1) {
+			// only update visible cells if there is no backpressure
+			player.visibleCells = visibleCells;
+		} else {
+			console.warn('backpressure on visible cells', player.ws.getBufferedAmount());
+		}
 	}
 
 	// "clear" the array, but do not reduce the allocated size of the array
@@ -1171,8 +1177,210 @@ const messagePacketU8 = (flags, color, nameU8, messageU8) => {
 
 let cliChatMuted = false;
 
-const wss = new WebSocketServer({ port: settings.listeningPort }); // TODO noPort, then implement /server/recaptcha/v3 and all that
-wss.on('connection', client => {
+uws.App()
+	.ws('/*', {
+		idleTimeout: 60,
+		maxBackpressure: 64 * 1024, // TODO: try with supremely low values
+		maxPayloadLength: 512,
+		sendPingsAutomatically: false,
+		open: client => {
+			console.log('new client connected');
+		},
+		close: client => {
+			const player = client.getUserData().player;
+			if (player) {
+				player.disconnectedAt = now;
+				player.ws = undefined;
+			}
+		},
+		message: (client, buf) => {
+			const player = client.getUserData().player;
+			const dat = new DataView(buf);
+			const u8 = new Uint8Array(buf);
+			if (!dat.byteLength) return client.end(1009, 'Unexpected message size');
+			if (!player) {
+				if (u8.length !== SIG_VERSION_STRING_U8.length) return client.end(1003, 'Ambiguous protocol');
+				for (let i = 0; i < u8.length; ++i) {
+					if (u8[i] !== SIG_VERSION_STRING_U8[i]) return client.end(1003, 'Ambiguous protocol');
+				}
+
+				const newPlayer = {
+					bot: false,
+					camera: { x: 0, y: 0, scale: 1 },
+					chatAt: now,
+					clanU8: EMPTY_STRING_U8,
+					disconnectedAt: 0,
+					lastW: 0,
+					minionCommander: undefined,
+					mouseX: 0,
+					mouseY: 0,
+					nameU8: EMPTY_STRING_U8,
+					owned: new Set(),
+					q: false,
+					rgb: 0x7f7f7f,
+					showClanmates: false,
+					skinU8: EMPTY_STRING_U8,
+					spawn: undefined,
+					splits: 0,
+					state: PLAYER_STATE_IDLE,
+					sub: false,
+					updated: now,
+					visibleCells: new Set(),
+					w: false,
+					ws: client,
+				};
+				players.add(newPlayer);
+				client.getUserData().player = newPlayer;
+
+				client.cork(() => { // TODO am i corking correctly?
+					void client.send(SIG_HANDSHAKE_U8, true);
+					void client.send(BORDER_UPDATE_PACKET_U8, true);
+				});
+				return;
+			}
+
+			player.updated = now;
+
+			let o = 0;
+			const readUtf8 = () => { // null-terminated utf8 string
+				let start = o;
+				while (o < u8.length && u8[o]) ++o;
+				return textDecoder.decode(u8.subarray(start, o));
+			};
+
+			const opcode = u8[o++];
+			if (opcode === 0) {
+				let body;
+				try {
+					body = JSON.parse(readUtf8());
+				} catch (err) {
+					console.error(err);
+					return client.end(1003, 'Unexpected message format');
+				}
+
+				if (typeof body !== 'object' || typeof body.name !== 'string'
+					|| (body.skin && typeof body.skin !== 'string')
+					|| (body.clan && typeof body.clan !== 'string')) {
+					return client.end(1003, 'Unexpected message format');
+				}
+
+				const spectating = body.state ==/*=*/ 2;
+				if (!spectating && settings.serverPassword && settings.serverPassword !== body.password) {
+					void client.send(new Uint8Array([0xb4]), true); // password prompt
+					return;
+				}
+
+				player.spawn = {
+					nameU8: encodeUtf8AsU8(body.name.substring(0, 64)),
+					// low limit, to prevent accessing things that aren't skins
+					skinU8: encodeUtf8AsU8(body.skin ? body.skin.substring(0, 20) : ''),
+					spectating,
+					sub: !!body.sub,
+				};
+				player.clan = encodeUtf8AsU8(body.clan ? body.clan.substring(0, 32) : '');
+			} else if (opcode === 0x10) {
+				if (dat.byteLength === 13) {
+					player.mouseX = dat.getInt32(o, true);
+					player.mouseY = dat.getInt32(o + 4, true);
+				} else if (dat.byteLength === 9) { // no one actually uses this but it's supported
+					player.mouseX = dat.getInt16(o, true);
+					player.mouseY = dat.getInt16(o + 2, true);
+				} else if (dat.byteLength === 21) {
+					player.mouseX = ~~dat.getFloat64(o, true);
+					player.mouseY = ~~dat.getFloat64(o + 8, true);
+				} else client.end(1003, 'Unexpected message format');
+			} else if (opcode === 0x11) ++player.splits;
+			else if (opcode === 0x12) player.q = true;
+			else if (opcode === 0x13) player.q = false;
+			else if (opcode === 0x15) player.w = true;
+			else if (opcode === 0x63) {
+				if (dat.byteLength < 2) return client.end(1003, 'Bad message format');
+				++o; // skip flags altogether
+				const message = readUtf8().trim();
+				if (message[0] === '/' && message.length >= 2) {
+					let [command, ...args] = message.split(' ');
+					command = command.toLowerCase();
+					const serverMessage = (cacheId, msg) => {
+						void client.send(messagePacketU8(0x80, 0xc03f3f, SERVER_NAME_U8, serverMessageCache[cacheId] ??= encodeUtf8AsU8(msg)), true);
+					}
+					if (command === '/help') {
+						serverMessage(0, 'available commands:');
+						serverMessage(1, 'id - get your id');
+						serverMessage(2, 'worldid - get your world\'s id');
+						serverMessage(3, 'leaveworld - leave your world');
+						serverMessage(4, 'joinworld <id> - try to join a world');
+					} else if (command === '/id') {
+						serverMessage(5, 'your ID is 0');
+					} else if (command === '/worldid') {
+						if (player.state === PLAYER_STATE_LIMBO) serverMessage(6, 'you\'re not in a world');
+						else serverMessage(7, 'your world ID is 1');
+					} else if (command === '/leaveworld') {
+						if (player.state === PLAYER_STATE_LIMBO) return serverMessage(8, 'you\'re not in a world');
+
+						let score = 0;
+						for (const cell of player.owned) {
+							score += cell.r * cell.r / 100;
+						}
+						if (score >= 5500) return serverMessage(9, 'you have >5500 score');
+
+						player.state = PLAYER_STATE_LIMBO;
+						for (const cell of player.owned) {
+							cell.dead = true;
+							bitgridRemove(cell);
+						}
+						player.owned.clear();
+						
+						let j = 0;
+						for (let i = 0, l = playerCells.length; i < l; ++i) {
+							playerCells[j] = playerCells[i];
+							if (playerCells[i].owner !== player) ++j;
+						}
+						playerCells.length = j;
+
+						j = 0;
+						for (let i = 0, l = boostingCells.length; i < l; ++i) {
+							boostingCells[j] = boostingCells[i];
+							if (boostingCells[i].owner !== player) ++j;
+						}
+						boostingCells.length = j;
+
+						void client.send(new Uint8Array([0x12]), true); // world reset
+					} else if (command === '/joinworld') {
+						// just assume the argument is 1
+						if (player.state !== PLAYER_STATE_LIMBO) return serverMessage(10, 'you\'re already in a world');
+						player.state = PLAYER_STATE_IDLE;
+					} else {
+						serverMessage(11, 'unknown command, execute /help for the list of commands');
+					}
+
+					return;
+				}
+
+				if (now - player.chatAt < 5) return; // no cooldown on commands (respawns), but slow down chats
+				player.chatAt = now;
+				const trimmed = message.substring(0, 32);
+				const packet = messagePacketU8(
+					0,
+					player.rgb,
+					player.nameU8 === EMPTY_STRING_U8 ? SPECTATOR_NAME : player.nameU8,
+					encodeUtf8AsU8(trimmed),
+				);
+				for (const otherPlayer of players) {
+					if (otherPlayer.state !== PLAYER_STATE_LIMBO && otherPlayer.ws)
+						void otherPlayer.ws.send(packet, true);
+				}
+				// TODO there should be a better way to print chat messages
+				if (!cliChatMuted) console.log(`  [${textDecoder.decode(player.nameU8)}] ${trimmed}`);
+			} else if (opcode === 0xfe) {
+				// stats
+				if (player.state === PLAYER_STATE_LIMBO) return;
+				void client.send(statsU8, true);
+			}
+		},
+	})
+	.listen(settings.listeningPort, () => console.log(`Listening on port ${settings.listeningPort}`));
+
+/*
 	let player;
 	setTimeout(() => {
 		if (!player && client.readyState <= 1) {
@@ -1249,7 +1457,7 @@ wss.on('connection', client => {
 			if (body.skin && typeof body.skin !== 'string') return client.close();
 			if (body.clan && typeof body.clan !== 'string') return client.close();
 
-			const spectating = body.state ==/*=*/ 2;
+			const spectating = body.state ==/*=* / 2;
 			if (!spectating && settings.serverPassword && settings.serverPassword !== body.password) {
 				client.send(new Uint8Array([ 0xb4 ])); // password prompt
 				return;
@@ -1364,8 +1572,7 @@ wss.on('connection', client => {
 		}
 	});
 });
-
-console.log(`server started in ${(performance.now() - serverStartTime).toFixed(1)}ms`);
+*/
 
 const commandStream = readline.createInterface({
     input: process.stdin,
@@ -1428,8 +1635,7 @@ const ask = input => {
 			// no sever flag, otherwise it gets duplicated between sigfixes tabs
 			const packet = messagePacketU8(0x80, 0xc03f3f, SERVER_NAME_U8, encodeUtf8AsU8(args.join(' ')));
 			for (const player of players) {
-				if (player.bot || player.minionCommander) continue;
-				if (player.state !== PLAYER_STATE_LIMBO && player.ws.readyState === 1) player.ws.send(packet);
+				if (player.state !== PLAYER_STATE_LIMBO && player.ws) void player.ws.send(packet, true);
 			}
 		} else if (command === 'setting') {
 			if (args[0] in settings) {
@@ -1481,7 +1687,7 @@ const ask = input => {
 			};
 			console.log(`memory: ${pretty(memory.heapUsed)} / ${pretty(memory.heapTotal)} / ${pretty(memory.rss)} / ${pretty(memory.external)}`);
 
-			const uptimeValue = (performance.now() - serverStartTime) / 1000;
+			const uptimeValue = performance.now() / 1000;
 			let uptime = `${~~(uptimeValue % 60)}s`;
 			if (uptimeValue >= 60) uptime = `${~~(uptimeValue / 60 % 60)}m ${uptime}`;
 			if (uptimeValue >= 3600) uptime = `${~~(uptimeValue / 3600 % 24)}h ${uptime}`;
@@ -1548,3 +1754,5 @@ setInterval(() => {
 	}
 	log.write(`${new Date().toISOString()} | ${(avgCells1 / 25).toFixed(2)} -> ${(avgCells2 / 25).toFixed(2)} -> ${(avgCells3 / 25).toFixed(2)} -> ${(avgCon1 / 25).toFixed(2)} -> ${(avgCon2 / 25).toFixed(2)} -> ${(avgCon3 / 25).toFixed(2)} (${(avgTickTime / 25 * 2.5).toFixed(1)}% load) | ${playing} playing, ${spectating} spectating, ${idle} idle, ${minions} minions, ${bots} bots | ${realPellets}(${pellets}) pellets, ${realViruses}(${viruses}), ${realEjects} ejects, ${realPlayerCells} player cells, ${realCells} total cells\n`);
 }, 15_000);
+
+console.log(`server started in ${performance.now().toFixed(1)}ms`);

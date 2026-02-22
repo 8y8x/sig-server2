@@ -1,5 +1,5 @@
 {
-    "listenerMaxConnections": 100,
+    "listenerMaxConnections": 9999,
     "listenerMaxClientDormancy": 60000,
     "listeningPort": 80,
     "serverName": "8y8x/sig-server2",
@@ -63,7 +63,7 @@
     "minionName": "\t",
     "minionSpawnSize": 100,
     "pelletMinSize": 20,
-    "pelletCount": 21000,
+    "pelletCount": 5500,
     "virusMinCount": 20,
     "virusMaxCount": 30,
     "virusSize": 100,
