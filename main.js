@@ -1586,7 +1586,7 @@ setInterval(() => {
 		else if (player.state === PLAYER_STATE_PLAYING) ++playing;
 		else ++idle;
 	}
-	log.write(`${new Date().toISOString()} | ${averages.map(x => (x / metricsMeasurements.length).toFixed(2)).join(' -> ')} (${(avgTickTime / 25 * 2.5).toFixed(1)}% load) | ${playing} playing, ${spectating} spectating, ${idle} idle, ${minions} minions, ${bots} bots | ${realPellets}(${pellets}) pellets, ${realViruses}(${viruses}), ${realEjects} ejects, ${realPlayerCells} player cells, ${realCells} total cells\n`);
+	log.write(`${new Date().toISOString()} | ${averages.map(x => (x / metricsMeasurements.length).toFixed(2)).join(' -> ')} (${(avgTickTime / metricsMeasurements.length * 2.5).toFixed(1)}% load) | ${playing} playing, ${spectating} spectating, ${idle} idle, ${minions} minions, ${bots} bots | ${realPellets}(${pellets}) pellets, ${realViruses}(${viruses}), ${realEjects} ejects, ${realPlayerCells} player cells, ${realCells} total cells\n`);
 }, 15_000);
 
 console.log(`server started in ${performance.now().toFixed(1)}ms`);
