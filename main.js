@@ -1006,7 +1006,9 @@ const worldTick = () => {
 			writerU8[0] = 0x11;
 			writerDat.setFloat32(1, player.camera.x, true);
 			writerDat.setFloat32(5, player.camera.y, true);
-			writerDat.setFloat32(9, player.camera.scale, true);
+			// make maximum scale 0.39, otherwise sigfixes's spectator tab will constantly swap between spectating
+			// and roaming
+			writerDat.setFloat32(9, Math.min(player.camera.scale, 0.39), true);
 			void player.ws.send(writerU8.subarray(0, 13), true);
 		}
 
