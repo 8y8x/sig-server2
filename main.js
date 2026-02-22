@@ -608,8 +608,6 @@ const worldTick = () => {
 		}
 	}
 
-	tickMeasurement('cells3');
-
 	for (const player of players) {
 		if (player.disconnectedAt) {
 			if (player.state === PLAYER_STATE_PLAYING && now - player.disconnectedAt > settings.worldPlayerDisposeDelay) {
@@ -850,7 +848,7 @@ const worldTick = () => {
 		});
 	}
 
-	tickMeasurement('cells4');
+	tickMeasurement('cells3');
 
 	// compile statistics
 	let avgTickTime = 0;
@@ -912,8 +910,12 @@ const worldTick = () => {
 		if (player.camera === largestPlayer?.camera) visibleCells = new Set(largestPlayer.owned);
 		else visibleCells = new Set(player.owned);
 
-		const cameraWidth = 1920 / player.camera.scale / 2 * settings.playerViewScaleMult;
-		const cameraHeight = 1080 / player.camera.scale / 2 * settings.playerViewScaleMult;
+		let cameraWidth = 1920 / player.camera.scale / 2 * settings.playerViewScaleMult;
+		let cameraHeight = 1080 / player.camera.scale / 2 * settings.playerViewScaleMult;
+		if (player.bot) {
+			cameraWidth /= 3;
+			cameraHeight /= 3;
+		}
 		const cameraXmin = player.camera.x - cameraWidth;
 		const cameraXmax = player.camera.x + cameraWidth;
 		const cameraYmin = player.camera.y - cameraHeight;
@@ -1135,9 +1137,15 @@ const worldTick = () => {
 		} else {
 			const cameraWidth = 1920 / player.camera.scale / 2 * settings.playerViewScaleMult;
 			const cameraHeight = 1080 / player.camera.scale / 2 * settings.playerViewScaleMult;
-			const d = Math.max(1, Math.hypot(mouseX, mouseY));
-			player.mouseX = leader.x + mouseX / d * cameraWidth;
-			player.mouseY = leader.y + mouseY / d * cameraHeight;
+			const d = Math.hypot(mouseX, mouseY);
+			if (d >= 0.001) {
+				player.mouseX = leader.x + mouseX / d * cameraWidth;
+				player.mouseY = leader.y + mouseY / d * cameraHeight;
+			} else {
+				// clockwise rotation around the map if it can't find anything
+				player.mouseX = leader.y;
+				player.mouseY = -leader.x;
+			}
 		}
 	}
 
@@ -1493,7 +1501,8 @@ const ask = input => {
 				}
 				avgTickTime += frame.time;
 			}
-			console.log(`load:   ${(avgTickTime / 25).toFixed(2)} ms / 40 ms (${(avgTickTime / 25 * 2.5).toFixed(2)}%)`);
+			avgTickTime /= metricsMeasurements.length;
+			console.log(`load:   ${avgTickTime.toFixed(2)} ms / 40 ms (${(avgTickTime * 2.5).toFixed(2)}%)`);
 			for (let i = 0; i < metricsPointsLabels.length; ++i) {
 				console.log(`     -> ${(averages[i] / metricsMeasurements.length).toFixed(2)} ms (${metricsPointsLabels[i]})`);
 			}
