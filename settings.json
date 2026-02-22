@@ -15,7 +15,7 @@
     "worldMapH": 17071,
     "worldSafeSpawnTries": 64,
     "worldPlayerDisposeDelay": 1500,
-    "worldPlayerBotsPerWorld": 30,
+    "worldPlayerBotsPerWorld": 40,
     "worldPlayerBotNames": [
         "{*}Valeriy",
         "{*}Mtch",

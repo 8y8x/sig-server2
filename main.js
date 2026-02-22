@@ -1466,10 +1466,16 @@ const ask = input => {
 				process.exit(0);
 			}, 5000);
 		} else if (command === 'say') {
-			// no sever flag, otherwise it gets duplicated between sigfixes tabs
+			// if using the server flag, then sigfixes will duplicate messages between tabs, so
+			// don't send messages to tabs on the same IP address
 			const packet = messagePacketU8(0x80, 0xc03f3f, SERVER_NAME_U8, encodeUtf8AsU8(args.join(' ')));
+			const usedAddresses = new Set(); 
 			for (const player of players) {
-				if (player.state !== PLAYER_STATE_LIMBO && player.ws) void player.ws.send(packet, true);
+				if (player.state === PLAYER_STATE_LIMBO || !player.ws) continue;
+				const address = textDecoder.decode(player.ws.getRemoteAddressAsText());
+				if (usedAddresses.has(address)) continue;
+				usedAddresses.add(address);
+				void player.ws.send(packet, true);
 			}
 		} else if (command === 'setting') {
 			if (args[0] in settings) {
