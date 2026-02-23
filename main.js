@@ -817,7 +817,7 @@ const worldTick = () => {
 	let playerBots = 0;
 	for (const player of players) {
 		if (player.bot) {
-			if (playerBots > settings.worldPlayerBotsPerWorld) player.disconnectedAt = -Infinity;
+			if (playerBots >= settings.worldPlayerBotsPerWorld) player.disconnectedAt = -Infinity;
 			else ++playerBots;
 		}
 	}
