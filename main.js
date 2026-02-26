@@ -97,8 +97,8 @@ const bitgridSearch = (xmin, xmax, ymin, ymax, cb) => {
 //========== world =====================================================================================================
 
 const [CELL_TYPE_PLAYER, CELL_TYPE_PELLET, CELL_TYPE_EJECT, CELL_TYPE_VIRUS] = [Symbol(), Symbol(), Symbol(), Symbol()];
-const [PLAYER_STATE_IDLE, PLAYER_STATE_PLAYING, PLAYER_STATE_ROAM, PLAYER_STATE_SPECTATE, PLAYER_STATE_LIMBO]
-	= [Symbol(), Symbol(), Symbol(), Symbol(), Symbol()];
+const [PLAYER_STATE_IDLE, PLAYER_STATE_PLAYING, PLAYER_STATE_ROAM, PLAYER_STATE_SPECTATE]
+	= [Symbol(), Symbol(), Symbol(), Symbol()];
 const PLAYER_OWNER_SERVER = {
 	bot: false,
 	camera: { x: 0, y: 0, scale: 1 },
@@ -689,7 +689,7 @@ const worldTick = () => {
 			// spawn request
 			if (!player.owned.size) {
 				if (!player.spawn && player.state === PLAYER_STATE_PLAYING) player.state = PLAYER_STATE_IDLE;
-				else if (player.spawn && player.state !== PLAYER_STATE_LIMBO) {
+				else if (player.spawn) {
 					if (player.spawn.spectating) player.state = PLAYER_STATE_SPECTATE;
 					else {
 						player.nameU8 = player.spawn.nameU8;
@@ -882,14 +882,6 @@ const worldTick = () => {
 		if (now - player.updated >= settings.listenerMaxClientDormancy / 40) {
 			if (!player.bot && !player.minionCommander) player.ws.close();
 			else player.disconnectedAt = -Infinity;
-			continue;
-		}
-
-		if (player.state === PLAYER_STATE_LIMBO) {
-			player.state = PLAYER_STATE_IDLE;
-			player.spawn = undefined; // but make sure matchmaker enqueue is done first
-			player.w = player.q = false;
-			player.splits = 0;
 			continue;
 		}
 
@@ -1342,18 +1334,14 @@ uws.App()
 					} else if (command === '/id') {
 						serverMessage(5, 'your ID is 0');
 					} else if (command === '/worldid') {
-						if (player.state === PLAYER_STATE_LIMBO) serverMessage(6, 'you\'re not in a world');
-						else serverMessage(7, 'your world ID is 1');
+						serverMessage(7, 'your world ID is 1');
 					} else if (command === '/leaveworld') {
-						if (player.state === PLAYER_STATE_LIMBO) return serverMessage(8, 'you\'re not in a world');
-
 						let score = 0;
 						for (const cell of player.owned) {
 							score += cell.r * cell.r / 100;
 						}
 						if (score >= 5500) return serverMessage(9, 'you have >5500 score');
 
-						player.state = PLAYER_STATE_LIMBO;
 						for (const cell of player.owned) {
 							cell.dead = true;
 							bitgridRemove(cell);
@@ -1375,10 +1363,13 @@ uws.App()
 						boostingCells.length = j;
 
 						void client.send(new Uint8Array([0x12]), true); // world reset
-					} else if (command === '/joinworld') {
-						// just assume the argument is 1
-						if (player.state !== PLAYER_STATE_LIMBO) return serverMessage(10, 'you\'re already in a world');
+
 						player.state = PLAYER_STATE_IDLE;
+						player.spawn = undefined; // but make sure matchmaker enqueue is done first
+						player.w = player.q = false;
+						player.splits = 0;
+					} else if (command === '/joinworld') {
+						// don't do anything
 					} else {
 						serverMessage(11, 'unknown command, execute /help for the list of commands');
 					}
@@ -1396,14 +1387,12 @@ uws.App()
 					encodeUtf8AsU8(trimmed),
 				);
 				for (const otherPlayer of players) {
-					if (otherPlayer.state !== PLAYER_STATE_LIMBO && otherPlayer.ws)
-						void otherPlayer.ws.send(packet, true);
+					if (otherPlayer.ws) void otherPlayer.ws.send(packet, true);
 				}
 				// TODO there should be a better way to print chat messages
 				if (!cliChatMuted) console.log(`  [${textDecoder.decode(player.nameU8)}] ${trimmed}`);
 			} else if (opcode === 0xfe) {
 				// stats
-				if (player.state === PLAYER_STATE_LIMBO) return;
 				void client.send(statsU8, true);
 			}
 		},
@@ -1473,7 +1462,7 @@ const ask = input => {
 			const packet = messagePacketU8(0x80, 0xc03f3f, SERVER_NAME_U8, encodeUtf8AsU8(args.join(' ')));
 			const usedAddresses = new Set(); 
 			for (const player of players) {
-				if (player.state === PLAYER_STATE_LIMBO || !player.ws) continue;
+				if (!player.ws) continue;
 				const address = textDecoder.decode(player.ws.getRemoteAddressAsText());
 				if (usedAddresses.has(address)) continue;
 				usedAddresses.add(address);
@@ -1592,5 +1581,5 @@ setInterval(() => {
 console.log(`server started in ${performance.now().toFixed(1)}ms`);
 
 process.on('uncaughtException', (err, origin) => {
-	log.write(`${new Date().toISOString()} | uncaughtException:\nerr: ${err}\norigin: ${origin}`);
+	log.write(`${new Date().toISOString()} | uncaughtException:\nerr: ${err}\norigin: ${origin}\n`);
 });
