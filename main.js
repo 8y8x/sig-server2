@@ -1,5 +1,6 @@
 'use strict';
 
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const readline = require('node:readline');
 const uws = require('uWebSockets.js');
@@ -22,7 +23,9 @@ const encodeUtf8AsU8 = s => {
 	return u8;
 };
 
-//========== bitgrid ===================================================================================================
+// +-------------------------------------------------------------------------------------------------------------------+
+// | Grids                                                                                                             |
+// +-------------------------------------------------------------------------------------------------------------------+
 
 // undefined behaviour occurs if a cell ever exists beyond the bitgrid, just keep it in mind
 // (the width and height) get all messed up
@@ -94,7 +97,9 @@ const bitgridSearch = (xmin, xmax, ymin, ymax, cb) => {
 	return false;
 };
 
-//========== world =====================================================================================================
+// +-------------------------------------------------------------------------------------------------------------------+
+// | Game                                                                                                              |
+// +-------------------------------------------------------------------------------------------------------------------+
 
 const [CELL_TYPE_PLAYER, CELL_TYPE_PELLET, CELL_TYPE_EJECT, CELL_TYPE_VIRUS] = [Symbol(), Symbol(), Symbol(), Symbol()];
 const [PLAYER_STATE_IDLE, PLAYER_STATE_PLAYING, PLAYER_STATE_ROAM, PLAYER_STATE_SPECTATE]
@@ -303,6 +308,10 @@ const encode = cell => {
 		firstDat.setUint16(8, cell.r, true);
 	}
 };
+
+// +-------------------------------------------------------------------------------------------------------------------+
+// | Game Loop                                                                                                         |
+// +-------------------------------------------------------------------------------------------------------------------+
 
 let lastLargestPlayerVisibleCells = new Set();
 const worldEatArray = [];
@@ -1155,7 +1164,9 @@ const worldTick = () => {
 };
 worldTick();
 
-//========== networking ================================================================================================
+// +-------------------------------------------------------------------------------------------------------------------+
+// | Main WebSocket Server                                                                                             |
+// +-------------------------------------------------------------------------------------------------------------------+
 
 const SIG_VERSION_STRING_U8 = textEncoder.encode('SIG 0.0.1\0');
 // SIG 0.0.1\0, then integers 0-255 (don't bother with opcode shuffling)
@@ -1187,7 +1198,9 @@ const messagePacketU8 = (flags, color, nameU8, messageU8) => {
 
 let cliChatMuted = false;
 
+const CONSOLE_HTML = fs.readFileSync('./console.html');
 uws.App()
+	.get('/console', (res, req) => res.end(CONSOLE_HTML))
 	.ws('/*', {
 		idleTimeout: 60,
 		maxBackpressure: 64 * 1024,
@@ -1394,6 +1407,184 @@ uws.App()
 	})
 	.listen(settings.listeningPort, () => console.log(`Listening on port ${settings.listeningPort}`));
 
+// +-------------------------------------------------------------------------------------------------------------------+
+// | Command Line Console                                                                                              |
+// +-------------------------------------------------------------------------------------------------------------------+
+
+let consoleKeys = new Map();
+try {
+	const source = fs.readFileSync('console-keys', 'utf-8');
+	for (const line of source.split('\n')) {
+		const [key, val] = line.split(' ');
+		if (key && val) consoleKeys.set(key, val);
+	}
+	if (consoleKeys.size) console.log(`Loaded ${consoleKeys.size} console keys`);
+} catch (_) { }
+
+uws.App()
+	.ws('/*', {
+		idleTimeout: 60,
+		maxBackpressure: 64 * 1024,
+		maxLifetime: 60, // minutes
+		maxPayloadLength: 2048,
+		sendPingsAutomatically: true,
+		upgrade: (res, req, context) => {
+			// early destroy, before upgrading the connection
+			const auth = req.getQuery('p');
+			if (!consoleKeys.has(auth)) return res.close();
+			res.upgrade({ auth },
+				req.getHeader('sec-websocket-key'),
+				req.getHeader('sec-websocket-protocol'),
+				req.getHeader('sec-websocket-extensions'),
+				context);
+		},
+		message: (client, buf) => {
+			if (!consoleKeys.has(client.getUserData().auth)) {
+				client.send(textEncoder.encode('You are no longer authenticated\n'), true);
+				return client.end();
+			}
+
+			const res = textEncoder.encode(command(textDecoder.decode(buf), false));
+			void client.send(res, true);
+		},
+	})
+	.listen(settings.consolePort, () => console.log(`Console listening on port ${settings.consolePort}`));
+
+const command = (line, superadmin) => {
+	const args = line.trim().split(' ');
+	const cmd = args.shift().toLowerCase();
+	if (cmd === 'exit') {
+		if (!superadmin) return 'Only the superadmin can run this\n';
+		process.exit(0);
+	} else if (cmd === 'heap-snapshot') {
+		if (!superadmin) return 'Only the superadmin can run this\n';
+		const start = performance.now();
+		const path = require('v8').writeHeapSnapshot();
+		return `written in ${(performance.now() - start).toFixed(2)} ms to ${path}\n`;
+	} else if (cmd === 'help') {
+		return 'Todo\n';
+	} else if (cmd === 'key-add') {
+		if (!superadmin) return 'Only the superadmin can run this\n';
+		if (!args[0]) return 'You need to specify a label (username) for this key\n';
+
+		const key = crypto.randomBytes(10).toString('hex');
+		consoleKeys.set(key, args[0]);
+		fs.promises.writeFile('console-keys', Array.from(consoleKeys).map(([k,v]) => `${k} ${v}`).join('\n'));
+		return `created a new key: ${key} for ${args[0]}\n`;
+	} else if (cmd === 'key-del') {
+		if (!superadmin) return 'Only the superadmin can run this\n';
+		for (const [key, val] of consoleKeys) {
+			if (key === args[0] || val === args[0]) {
+				consoleKeys.delete(key);
+				fs.promises.writeFile('console-keys', Array.from(consoleKeys).map(([k,v]) => `${k} ${v}`).join('\n'));
+				return `deleted key: ${key} for ${val}\n`;
+			}
+		}
+
+		return `couldn't find a console key for ${args[0]}`;
+	} else if (cmd === 'key-list') {
+		if (!superadmin) return 'Only the superadmin can run this\n';
+		if (!consoleKeys.size) return `0 keys\n`;
+		const lines = [];
+		let i = 0;
+		for (const [key, val] of consoleKeys) {
+			lines.push(`${i + 1}. ${key} - ${val}\n`);
+		}
+		return lines.join('');
+	} else if (cmd === 'players') {
+		return 'Todo\n';
+	} else if (cmd === 'safeexit') {
+		if (!superadmin) return 'Only the superadmin can run this\n';
+		setInterval(() => {
+			for (const player of players) {
+				if (player.minionCommander || player.bot) continue;
+				if (player.state === PLAYER_STATE_PLAYING) return;
+			}
+			process.exit(0);
+		}, 5000);
+	} else if (cmd === 'say') {
+		// if using the server flag, then sigfixes will duplicate messages between tabs, so
+		// don't send messages to tabs on the same IP address
+		const message = args.join(' ');
+		const packet = messagePacketU8(0x80, 0xc03f3f, SERVER_NAME_U8, encodeUtf8AsU8(message));
+		const usedAddresses = new Set(); 
+		for (const player of players) {
+			if (!player.ws) continue;
+			const address = textDecoder.decode(player.ws.getRemoteAddressAsText());
+			if (usedAddresses.has(address)) continue;
+			usedAddresses.add(address);
+			void player.ws.send(packet, true);
+		}
+		return `Server: ${message}\n`;
+	} else if (cmd === 'setting') {
+		if (!(args[0] in settings)) return `setting "${args[0]}" not found\n`;
+		if (!args[1]) return `${args[0]} : ${settings[args[0]]}\n`;
+		if (typeof settings[args[0]] !== 'number') return `setting "${args[0]}" has to be a number setting\n`;
+
+		const numeric = Number(args[1]);
+		if (Number.isNaN(numeric)) return `argument not a number\n`;
+
+		const old = settings[args[0]];
+		settings[args[0]] = numeric;
+		return `${args[0]} : ${old} -> ${numeric}\n`;
+	} else if (cmd === 'stats') {
+		const output = [];
+
+		const averages = [];
+		let avgTickTime = 0;
+		for (const frame of metricsMeasurements) {
+			for (let i = 0; i < frame.points.length; ++i) {
+				averages[i] = (averages[i] ?? 0) + frame.points[i];
+			}
+			avgTickTime += frame.time;
+		}
+		avgTickTime /= metricsMeasurements.length;
+		output.push(`load:   ${avgTickTime.toFixed(2)} ms / 40 ms (${(avgTickTime * 2.5).toFixed(2)}%)\n`);
+		for (let i = 0; i < metricsPointsLabels.length; ++i) {
+			output.push(`     -> ${(averages[i] / metricsMeasurements.length).toFixed(2)} ms (${metricsPointsLabels[i]})\n`);
+		}
+
+		const memory = process.memoryUsage();
+		const pretty = value => {
+			const units = ["B", "kiB", "MiB", "GiB", "TiB"]; let i = 0;
+		    for (; i < units.length && value / 1024 > 1; i++)
+		        value /= 1024;
+		    return `${value.toFixed(1)} ${units[i]}`;
+		};
+		output.push(`memory: ${pretty(memory.heapUsed)} / ${pretty(memory.heapTotal)} / ${pretty(memory.rss)} / ${pretty(memory.external)}\n`);
+
+		const uptimeValue = performance.now() / 1000;
+		let uptime = `${~~(uptimeValue % 60)}s`;
+		if (uptimeValue >= 60) uptime = `${~~(uptimeValue / 60 % 60)}m ${uptime}`;
+		if (uptimeValue >= 3600) uptime = `${~~(uptimeValue / 3600 % 24)}h ${uptime}`;
+		if (uptimeValue >= 86400) uptime = `${~~(uptimeValue / 86400)}d ${uptime}`;
+		output.push(`uptime: ${uptime}\n`);
+
+		let realPellets = 0, realViruses = 0, realEjects = 0, realPlayerCells = 0, realCells = 0;
+		let playing = 0, spectating = 0, idle = 0, minions = 0, bots = 0;
+		bitgridSearch(0, 31, 0, 31, cell => {
+			++realCells;
+			if (cell.type === CELL_TYPE_PELLET) ++realPellets;
+			else if (cell.type === CELL_TYPE_PLAYER) ++realPlayerCells;
+			else if (cell.type === CELL_TYPE_EJECT) ++realEjects;
+			else if (cell.type === CELL_TYPE_VIRUS) ++realViruses;
+		});
+		for (const player of players) {
+			if (player.minionCommander) ++minions;
+			else if (player.bot) ++bots;
+			else if (player.state === PLAYER_STATE_ROAM || player.state === PLAYER_STATE_SPECTATE) ++spectating;
+			else if (player.state === PLAYER_STATE_PLAYING) ++playing;
+			else ++idle;
+		}
+		output.push(`${realCells} cells - ${realPlayerCells} player cells, ${realPellets}(${pellets}) pellets, ${realEjects} ejects, ${realViruses}(${viruses}) viruses\n`);
+		output.push(`${playing} playing - ${spectating} spectating - ${idle} idle - ${minions} minions - ${bots} bots\n`);
+
+		return output.join('');
+	} else {
+		return `unknown command ${cmd}\n`;
+	}
+};
+
 const commandStream = readline.createInterface({
     input: process.stdin,
     output: process.stdout,
@@ -1402,147 +1593,15 @@ const commandStream = readline.createInterface({
     historySize: 64,
     removeHistoryDuplicates: true
 });
-
 const ask = input => {
-	input = input.trim();
-	if (input) {
-		const args = input.split(' ');
-		const command = args.shift().toLowerCase();
-		if (command === 'exit') {
-			process.exit(0);
-		} else if (command === 'help') {
-			console.log('exit - calls process.exit(0)');
-			console.log('help - show this help screen');
-			console.log('mute - stop showing chat on the command line');
-			console.log('players - shows a list of all real player and their names');
-			console.log('safeexit - calls process.exit(0) as soon as there are 0 players playing');
-			console.log('setting <name> <value> - changes a setting to a different value, or shows the current value');
-			console.log('snapshot - dumps a memory snapshot, this can take several seconds');
-			console.log('stats - show server uptime, load, memory usage, and player counts');
-			console.log('unmute - start showing chats again on the command line');
-		} else if (command === 'mute') {
-			cliChatMuted = true;
-			console.log('chat now muted on the cli');
-		} else if (command === 'players') {
-			for (const player of players) {
-				if (player.bot || player.minionCommander) continue;
-
-				let stateName;
-				if (player.state === PLAYER_STATE_IDLE) stateName = '----';
-				else if (player.state === PLAYER_STATE_PLAYING) stateName = 'play';
-				else if (player.state === PLAYER_STATE_ROAM) stateName = 'roam';
-				else if (player.state === PLAYER_STATE_SPECTATE) stateName = 'spec';
-				else stateName = 'xxxx';
-
-				let mass = 0;
-				for (const cell of player.owned) {
-					mass += cell.r * cell.r / 100;
-				}
-
-				// TODO should not be decoding text all the time
-				console.log(`- ${stateName} - ${~~mass} mass - ${textDecoder.decode(player.nameU8)}`);
-			}
-		} else if (command === 'safeexit') {
-			console.log('server will be exited once all players leave');
-			setInterval(() => {
-				for (const player of players) {
-					if (player.minionCommander || player.bot) continue;
-					if (player.state === PLAYER_STATE_PLAYING) return;
-				}
-				process.exit(0);
-			}, 5000);
-		} else if (command === 'say') {
-			// if using the server flag, then sigfixes will duplicate messages between tabs, so
-			// don't send messages to tabs on the same IP address
-			const packet = messagePacketU8(0x80, 0xc03f3f, SERVER_NAME_U8, encodeUtf8AsU8(args.join(' ')));
-			const usedAddresses = new Set(); 
-			for (const player of players) {
-				if (!player.ws) continue;
-				const address = textDecoder.decode(player.ws.getRemoteAddressAsText());
-				if (usedAddresses.has(address)) continue;
-				usedAddresses.add(address);
-				void player.ws.send(packet, true);
-			}
-		} else if (command === 'setting') {
-			if (args[0] in settings) {
-				if (args[1]) {
-					if (typeof settings[args[0]] !== 'number') console.log('setting is not a number');
-					else {
-						const numeric = Number(args[1]);
-						if (Number.isNaN(numeric)) console.log('argument not a number');
-						else {
-							const old = settings[args[0]];
-							settings[args[0]] = numeric;
-							console.log(`${args[0]} : ${old} -> ${numeric}`);
-						}
-					}
-				} else {
-					console.log(`${args[0]} : ${settings[args[0]]}`);
-				}
-			}
-		} else if (command === 'snapshot') {
-			const start = performance.now();
-			const path = require('v8').writeHeapSnapshot();
-			console.log(`written in ${(performance.now() - start).toFixed(2)} ms to ${path}`);
-		} else if (command === 'stats') {
-			const averages = [];
-			let avgTickTime = 0;
-			for (const frame of metricsMeasurements) {
-				for (let i = 0; i < frame.points.length; ++i) {
-					averages[i] = (averages[i] ?? 0) + frame.points[i];
-				}
-				avgTickTime += frame.time;
-			}
-			avgTickTime /= metricsMeasurements.length;
-			console.log(`load:   ${avgTickTime.toFixed(2)} ms / 40 ms (${(avgTickTime * 2.5).toFixed(2)}%)`);
-			for (let i = 0; i < metricsPointsLabels.length; ++i) {
-				console.log(`     -> ${(averages[i] / metricsMeasurements.length).toFixed(2)} ms (${metricsPointsLabels[i]})`);
-			}
-
-			const memory = process.memoryUsage();
-			const pretty = value => {
-				const units = ["B", "kiB", "MiB", "GiB", "TiB"]; let i = 0;
-			    for (; i < units.length && value / 1024 > 1; i++)
-			        value /= 1024;
-			    return `${value.toFixed(1)} ${units[i]}`;
-			};
-			console.log(`memory: ${pretty(memory.heapUsed)} / ${pretty(memory.heapTotal)} / ${pretty(memory.rss)} / ${pretty(memory.external)}`);
-
-			const uptimeValue = performance.now() / 1000;
-			let uptime = `${~~(uptimeValue % 60)}s`;
-			if (uptimeValue >= 60) uptime = `${~~(uptimeValue / 60 % 60)}m ${uptime}`;
-			if (uptimeValue >= 3600) uptime = `${~~(uptimeValue / 3600 % 24)}h ${uptime}`;
-			if (uptimeValue >= 86400) uptime = `${~~(uptimeValue / 86400)}d ${uptime}`;
-			console.log(`uptime: ${uptime}`);
-
-			let realPellets = 0, realViruses = 0, realEjects = 0, realPlayerCells = 0, realCells = 0;
-			let playing = 0, spectating = 0, idle = 0, minions = 0, bots = 0;
-			bitgridSearch(0, 31, 0, 31, cell => {
-				++realCells;
-				if (cell.type === CELL_TYPE_PELLET) ++realPellets;
-				else if (cell.type === CELL_TYPE_PLAYER) ++realPlayerCells;
-				else if (cell.type === CELL_TYPE_EJECT) ++realEjects;
-				else if (cell.type === CELL_TYPE_VIRUS) ++realViruses;
-			});
-			for (const player of players) {
-				if (player.minionCommander) ++minions;
-				else if (player.bot) ++bots;
-				else if (player.state === PLAYER_STATE_ROAM || player.state === PLAYER_STATE_SPECTATE) ++spectating;
-				else if (player.state === PLAYER_STATE_PLAYING) ++playing;
-				else ++idle;
-			}
-			console.log(`${realCells} cells - ${realPlayerCells} player cells, ${realPellets}(${pellets}) pellets, ${realEjects} ejects, ${realViruses}(${viruses}) viruses`);
-			console.log(`${playing} playing - ${spectating} spectating - ${idle} idle - ${minions} minions - ${bots} bots`);
-		} else if (command === 'unmute') {
-			cliChatMuted = false;
-			console.log('chat now unmuted on the cli');
-		} else {
-			console.log('unknown command');
-		}
-	}
+	console.log(command(input, true));
 	commandStream.question('@ ', ask);
 };
 commandStream.question('@ ', ask);
+
+// +-------------------------------------------------------------------------------------------------------------------+
+// | Resource Monitoring                                                                                               |
+// +-------------------------------------------------------------------------------------------------------------------+
 
 const log = fs.createWriteStream(`log-${new Date().toISOString()}.txt`);
 setInterval(() => {
