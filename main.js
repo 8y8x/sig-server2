@@ -1337,15 +1337,10 @@ uws.App()
 						serverMessage(7, 'your world ID is 1');
 					} else if (command === '/leaveworld') {
 						let score = 0;
-						for (const cell of player.owned) {
-							score += cell.r * cell.r / 100;
-						}
+						for (const cell of player.owned) score += cell.r * cell.r / 100;
 						if (score >= 5500) return serverMessage(9, 'you have >5500 score');
 
-						for (const cell of player.owned) {
-							cell.dead = true;
-							bitgridRemove(cell);
-						}
+						for (const cell of player.owned) bitgridRemove(cell);
 						player.owned.clear();
 						
 						let j = 0;
@@ -1365,7 +1360,7 @@ uws.App()
 						void client.send(new Uint8Array([0x12]), true); // world reset
 
 						player.state = PLAYER_STATE_IDLE;
-						player.spawn = undefined; // but make sure matchmaker enqueue is done first
+						player.spawn = undefined; // make sure we don't instantly respawn, messes up sigfixes logic
 						player.w = player.q = false;
 						player.splits = 0;
 					} else if (command === '/joinworld') {
