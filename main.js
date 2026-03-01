@@ -1505,194 +1505,219 @@ uws.App()
 	.listen(settings.consolePort, () => console.log(`Console listening on port ${settings.consolePort}`));
 
 const command = (line, superadmin) => {
-	const args = line.trim().split(' ');
-	const cmd = args.shift().toLowerCase();
-	if (cmd === 'exit') {
-		if (!superadmin) return 'Only the superadmin can run this\n';
-		process.exit(0);
-	} else if (cmd === 'heap-snapshot') {
-		if (!superadmin) return 'Only the superadmin can run this\n';
-		const start = performance.now();
-		const path = require('v8').writeHeapSnapshot();
-		return `written in ${(performance.now() - start).toFixed(2)} ms to ${path}\n`;
-	} else if (cmd === 'help') {
-		return 'Todo\n';
-	} else if (cmd === 'key-add') {
-		if (!superadmin) return 'Only the superadmin can run this\n';
-		if (!args[0]) return 'You need to specify a label (username) for this key\n';
+	const lines = [];
+	for (const statement of line.split(';')) {
+		lines.push((() => {
+			const args = statement.trim().split(' ');
+			const cmd = args.shift().toLowerCase();
+			if (cmd === 'exit') {
+				if (!superadmin) return 'Only the superadmin can run this\n';
+				process.exit(0);
+			} else if (cmd === 'heap-snapshot') {
+				if (!superadmin) return 'Only the superadmin can run this\n';
+				const start = performance.now();
+				const path = require('v8').writeHeapSnapshot();
+				return `written in ${(performance.now() - start).toFixed(2)} ms to ${path}\n`;
+			} else if (cmd === 'help') {
+				return [
+					'exit - stops the server (superadmin only)',
+					'heap-snapshot - captures exactly how memory is being used, for debugging (superadmin only)',
+					'key-add <username> - generates a console key for someone (superadmin only)',
+					'key-del <username or key> - revokes a console key (superadmin only)',
+					'key-list - lists all console keys (superadmin only)',
+					'mass <id> <mass> - sets a player\'s mass to this, evenly spread across all cells. if they\'re not alive, they will be spawned in',
+					'mass-all <mass> - sets all player mass to this', // TODO IMPL CONTINUE
+					'players - shows all active players and their ids',
+					'safeexit - stops the server once all players leave (superadmin only)',
+					'say <message> - broadcasts a message as the server, no length limit',
+					'setting - lists all settings',
+					'setting <key> - shows the value of a setting',
+					'setting <key> <value> - changes a setting to another value',
+					'stats - shows server load, uptime, player count, and cell count',
+				].join('\n') + '\n';
+			} else if (cmd === 'key-add') {
+				if (!superadmin) return 'Only the superadmin can run this\n';
+				if (!args[0]) return 'You need to specify a label (username) for this key\n';
 
-		const key = crypto.randomBytes(10).toString('hex');
-		consoleKeys.set(key, args[0]);
-		fs.promises.writeFile('console-keys', Array.from(consoleKeys).map(([k,v]) => `${k} ${v}`).join('\n'));
-		return `created a new key: ${key} for ${args[0]}\n`;
-	} else if (cmd === 'key-del') {
-		if (!superadmin) return 'Only the superadmin can run this\n';
-		for (const [key, val] of consoleKeys) {
-			if (key === args[0] || val === args[0]) {
-				consoleKeys.delete(key);
+				const key = crypto.randomBytes(10).toString('hex');
+				consoleKeys.set(key, args[0]);
 				fs.promises.writeFile('console-keys', Array.from(consoleKeys).map(([k,v]) => `${k} ${v}`).join('\n'));
-				return `deleted key: ${key} for ${val}\n`;
+				return `created a new key: ${key} for ${args[0]}\n`;
+			} else if (cmd === 'key-del') {
+				if (!superadmin) return 'Only the superadmin can run this\n';
+				for (const [key, val] of consoleKeys) {
+					if (key === args[0] || val === args[0]) {
+						consoleKeys.delete(key);
+						fs.promises.writeFile('console-keys', Array.from(consoleKeys).map(([k,v]) => `${k} ${v}`).join('\n'));
+						return `deleted key: ${key} for ${val}\n`;
+					}
+				}
+
+				return `couldn't find a console key for ${args[0]}`;
+			} else if (cmd === 'key-list') {
+				if (!superadmin) return 'Only the superadmin can run this\n';
+				if (!consoleKeys.size) return `0 keys\n`;
+				const lines = [];
+				let i = 1;
+				for (const [key, val] of consoleKeys) {
+					lines.push(`${i++}. ${key} - ${val}\n`);
+				}
+				return lines.join('');
+			} else if (cmd === 'players') {
+				return 'Todo\n';
+			} else if (cmd === 'safeexit') {
+				if (!superadmin) return 'Only the superadmin can run this\n';
+				setInterval(() => {
+					for (const player of players) {
+						if (player.minionCommander || player.bot) continue;
+						if (player.state === PLAYER_STATE_PLAYING) return;
+					}
+					process.exit(0);
+				}, 5000);
+			} else if (cmd === 'say') {
+				// if using the server flag, then sigfixes will duplicate messages between tabs, so
+				// don't send messages to tabs on the same IP address
+				const message = args.join(' ');
+				const packet = messagePacketU8(0x80, 0xc03f3f, SERVER_NAME_U8, encodeUtf8AsU8(message));
+				const usedAddresses = new Set(); 
+				for (const player of players) {
+					if (!player.ws) continue;
+					const address = textDecoder.decode(player.ws.getRemoteAddressAsText());
+					if (usedAddresses.has(address)) continue;
+					usedAddresses.add(address);
+					void player.ws.send(packet, true);
+				}
+				return `Server: ${message}\n`;
+			} else if (cmd === 'setting') {
+				if (!args[0]) {
+					return `All settings: ${Object.keys(settings).join(', ')}\n`;
+				}
+				if (!(args[0] in settings)) return `setting "${args[0]}" not found\n`;
+				if (!args[1]) {
+					const lines = [`${args[0]} : ${settings[args[0]]}\n`];
+					if (args[0] === 'serverPassword' && settings.serverPassword) {
+						lines.push(`If you want to turn off the password, run: setting serverPassword -\n`);
+					}
+					return lines.join('');
+				}
+
+				let value;
+				if (typeof settings[args[0]] === 'number') {
+					value = Number(args[1]);
+					if (Number.isNaN(value)) return `argument must be a number for this setting\n`;
+				} else if (typeof settings[args[0]] === 'boolean') {
+					if (args[1] === 'true') value = true;
+					else if (args[1] === 'false') value = false;
+					else return `argument must be true or false for this setting\n`;
+				} else if (typeof settings[args[0]] === 'string') {
+					value = args[1] === '-' ? '' : args[1];
+				} else {
+					return `this setting cannot be changed\n`;
+				}
+
+				// i might be a little dumb for writing this LOL
+				if (args[0] === 'listenerMaxConnections' && !superadmin) return `Only the superadmin can change listenerMaxConnections\n`;
+				if (args[0] === 'listenerMaxClientDormancy' && !superadmin) return `Only the superadmin can change listenerMaxClientDormancy\n`;
+				if (args[0] === 'listeningPort' && !superadmin) return `Only the superadmin can change listeningPort\n`;
+				if (args[0] === 'consolePort' && !superadmin) return `Only the superadmin can change consolePort\n`;
+				if (args[0] === 'worldMapW' && !(100 <= value && value <= 32767)) return `worldMapW must be between 100 and 32767\n`;
+				if (args[0] === 'worldPlayerBotsPerWorld' && !(0 <= value && value <= 1000)) return `worldPlayerBotsPerWorld must be between 0 and 1000\n`;
+				if (args[0] === 'worldMinionsPerPlayer' && !(0 <= value && value <= 2500)) return `worldMinionsPerPlayer must be between 0 and 2500\n`;
+				if (args[0] === 'worldMaxMinions' && !(0 <= value && value <= 2500)) return `worldMaxMinions must be between 0 and 2500\n`;
+				if (args[0] === 'minionName' && !superadmin) return `Only the superadmin can change minionName\n`;
+				if (args[0] === 'minionSpawnSize' && !(40 <= value && value <= 2500)) return `minionSpawnSize must be between 40 and 2500\n`;
+				if (args[0] === 'pelletMinSize' && !(1 <= value && value < 40)) return `pelletMinSize must be between 1 and 39\n`;
+				if (args[0] === 'pelletCount' && !(0 <= value && value <= 100000)) return `pelletCount must be between 0 and 100000\n`;
+				if (args[0] === 'virusMinCount' && !(0 <= value && value <= setting.virusMaxCount)) return `virusMinCount must be between 0 and virusMaxCount\n`;
+				if (args[0] === 'virusMaxCount' && !(0 <= value && value <= 10000)) return `virusMaxCount must be between 0 and 10000\n`;
+				if (args[0] === 'virusSize' && !(1 <= value && value <= 2500)) return `virusSize must be between 1 and 2500\n`;
+				if (args[0] === 'virusFeedTimes' && !(1 <= value && value <= 100)) return `virusFeedTimes must be between 1 and 100\n`;
+				if (args[0] === 'virusSplitBoost' && !(0 <= value && value <= 10000)) return `virusSplitBoost must be between 0 and 10000\n`;
+				if (args[0] === 'ejectedSize' && !(1 <= value && value <= 2500)) return `ejectedSize must be between 1 and 2500\n`;
+				if (args[0] === 'ejectingLoss' && !(1 <= value && value <= settings.playerMinEjectSize - 1)) return `ejectingLoss must be between 1 and (playerMinEjectSize - 1)\n`;
+				// (nothing for ejectDispersion)
+				if (args[0] === 'ejectedCellBoost' && !(0 <= value && value <= 10000)) return `ejectedCellBoost must be between 0 and 10000\n`;
+				if (args[0] === 'playerRoamSpeed' && !(1 <= value && value <= 1000)) return `playerRoamSpeed must be between 1 and 1000\n`;
+				if (args[0] === 'playerRoamViewScale' && !(0.01 <= value && value < 0.4)) return `playerRoamViewScale must be between 0.01 and 0.4\n`;
+				if (args[0] === 'playerViewScaleMult' && !(1 <= value && value <= 2)) return `playerViewScaleMult must be between 1 and 2\n`;
+				if (args[0] === 'playerMinSize' && !(40 <= value && value <= 2500)) return `playerMinSize must be between 40 and 2500\n`;
+				if (args[0] === 'playerSpawnSize' && !(40 <= value && value <= 10000)) return `playerSpawnSize must be between 40 and 10000\n`;
+				if (args[0] === 'playerMaxSize' && !(40 <= value && value <= 10000)) return `playerMaxSize must be between 40 and 10000\n`;
+				if (args[0] === 'playerMinSplitSize' && !(40 <= value && value <= 2500)) return `playerMinSplitSize must be between 40 and 2500\n`;
+				if (args[0] === 'playerMinEjectSize' && !(settings.ejectingLoss + 1 <= value && value <= 2500)) return `playerMinEjectSize must be between (ejectingLoss + 1) and 2500\n`;
+				if (args[0] === 'playerEjectDelay' && !(0 <= value && value <= 25)) return `playerEjectDelay must be between 0 and 25\n`;
+				if (args[0] === 'playerMaxCells' && !(1 <= value && value <= 1024)) return `playerMaxCells must be between 1 and 1024\n`;
+				if (args[0] === 'playerMoveMult' && !(0 <= value && value <= 25)) return `playerMoveMult must be between 0 and 25\n`;
+				if (args[0] === 'playerSplitDistance' && !(0 <= value && value <= 1000)) return `playerSplitDistance must be between 0 and 1000\n`;
+				if (args[0] === 'playerSplitBoost' && !(0 <= value && value <= 10000)) return `playerSplitBoost must be between 0 and 10000\n`;
+				if (args[0] === 'playerNoCollideDelay' && !(0 <= value && value <= 100)) return `playerNoCollideDelay must be between 0 and 100\n`;
+				if (args[0] === 'playerMergeTime' && !(0 <= value && value <= 3600)) return `playerMergeTime must be between 0 and 3600\n`;
+				if (args[0] === 'playerMergeTimeIncrease' && !(0 <= value && value <= 1)) return `playerMergeTimeIncrease must be between 0 and 1\n`;
+				if (args[0] === 'playerDecayMult' && !(0 <= value && value <= 0.5)) return `playerDecayMult must be between 0 and 0.5\n`;
+
+				const old = settings[args[0]];
+				settings[args[0]] = value;
+				return `${args[0]} : ${old} -> ${value}\n`;
+			} else if (cmd === 'stats') {
+				const output = [];
+
+				const averages = [];
+				let avgTickTime = 0;
+				for (const frame of metricsMeasurements) {
+					for (let i = 0; i < frame.points.length; ++i) {
+						averages[i] = (averages[i] ?? 0) + frame.points[i];
+					}
+					avgTickTime += frame.time;
+				}
+				avgTickTime /= metricsMeasurements.length;
+				output.push(`load:   ${avgTickTime.toFixed(2)} ms / 40 ms (${(avgTickTime * 2.5).toFixed(2)}%)\n`);
+				for (let i = 0; i < metricsPointsLabels.length; ++i) {
+					output.push(`     -> ${(averages[i] / metricsMeasurements.length).toFixed(2)} ms (${metricsPointsLabels[i]})\n`);
+				}
+
+				const memory = process.memoryUsage();
+				const pretty = value => {
+					const units = ["B", "kiB", "MiB", "GiB", "TiB"]; let i = 0;
+				    for (; i < units.length && value / 1024 > 1; i++)
+				        value /= 1024;
+				    return `${value.toFixed(1)} ${units[i]}`;
+				};
+				output.push(`memory: ${pretty(memory.heapUsed)} / ${pretty(memory.heapTotal)} / ${pretty(memory.rss)} / ${pretty(memory.external)}\n`);
+
+				const uptimeValue = performance.now() / 1000;
+				let uptime = `${~~(uptimeValue % 60)}s`;
+				if (uptimeValue >= 60) uptime = `${~~(uptimeValue / 60 % 60)}m ${uptime}`;
+				if (uptimeValue >= 3600) uptime = `${~~(uptimeValue / 3600 % 24)}h ${uptime}`;
+				if (uptimeValue >= 86400) uptime = `${~~(uptimeValue / 86400)}d ${uptime}`;
+				output.push(`uptime: ${uptime}\n`);
+
+				let realPellets = 0, realViruses = 0, realEjects = 0, realPlayerCells = 0, realCells = 0;
+				let playing = 0, spectating = 0, idle = 0, minions = 0, bots = 0;
+				bitgridSearch(0, 31, 0, 31, cell => {
+					++realCells;
+					if (cell.type === CELL_TYPE_PELLET) ++realPellets;
+					else if (cell.type === CELL_TYPE_PLAYER) ++realPlayerCells;
+					else if (cell.type === CELL_TYPE_EJECT) ++realEjects;
+					else if (cell.type === CELL_TYPE_VIRUS) ++realViruses;
+				});
+				for (const player of players) {
+					if (player.minionCommander) ++minions;
+					else if (player.bot) ++bots;
+					else if (player.state === PLAYER_STATE_ROAM || player.state === PLAYER_STATE_SPECTATE) ++spectating;
+					else if (player.state === PLAYER_STATE_PLAYING) ++playing;
+					else ++idle;
+				}
+				output.push(`${realCells} cells - ${realPlayerCells} player cells, ${realPellets}(${pellets}) pellets, ${realEjects} ejects, ${realViruses}(${viruses}) viruses\n`);
+				output.push(`${playing} playing - ${spectating} spectating - ${idle} idle - ${minions} minions - ${bots} bots\n`);
+
+				return output.join('');
+			} else {
+				return `unknown command ${cmd}\n`;
 			}
-		}
-
-		return `couldn't find a console key for ${args[0]}`;
-	} else if (cmd === 'key-list') {
-		if (!superadmin) return 'Only the superadmin can run this\n';
-		if (!consoleKeys.size) return `0 keys\n`;
-		const lines = [];
-		let i = 0;
-		for (const [key, val] of consoleKeys) {
-			lines.push(`${i + 1}. ${key} - ${val}\n`);
-		}
-		return lines.join('');
-	} else if (cmd === 'players') {
-		return 'Todo\n';
-	} else if (cmd === 'safeexit') {
-		if (!superadmin) return 'Only the superadmin can run this\n';
-		setInterval(() => {
-			for (const player of players) {
-				if (player.minionCommander || player.bot) continue;
-				if (player.state === PLAYER_STATE_PLAYING) return;
-			}
-			process.exit(0);
-		}, 5000);
-	} else if (cmd === 'say') {
-		// if using the server flag, then sigfixes will duplicate messages between tabs, so
-		// don't send messages to tabs on the same IP address
-		const message = args.join(' ');
-		const packet = messagePacketU8(0x80, 0xc03f3f, SERVER_NAME_U8, encodeUtf8AsU8(message));
-		const usedAddresses = new Set(); 
-		for (const player of players) {
-			if (!player.ws) continue;
-			const address = textDecoder.decode(player.ws.getRemoteAddressAsText());
-			if (usedAddresses.has(address)) continue;
-			usedAddresses.add(address);
-			void player.ws.send(packet, true);
-		}
-		return `Server: ${message}\n`;
-	} else if (cmd === 'setting') {
-		if (!(args[0] in settings)) return `setting "${args[0]}" not found\n`;
-		if (!args[1]) {
-			const lines = [`${args[0]} : ${settings[args[0]]}\n`];
-			if (args[0] === 'serverPassword' && settings.serverPassword) {
-				lines.push(`If you want to turn off the password, run: setting serverPassword -\n`);
-			}
-			return lines.join('');
-		}
-
-		let value;
-		if (typeof settings[args[0]] === 'number') {
-			value = Number(args[1]);
-			if (Number.isNaN(value)) return `argument must be a number for this setting\n`;
-		} else if (typeof settings[args[0]] === 'boolean') {
-			if (args[1] === 'true') value = true;
-			else if (args[1] === 'false') value = false;
-			else return `argument must be true or false for this setting\n`;
-		} else if (typeof settings[args[0]] === 'string') {
-			value = args[1] === '-' ? '' : args[1];
-		} else {
-			return `this setting cannot be changed\n`;
-		}
-
-		// i might be a little dumb for writing this LOL
-		if (args[0] === 'listenerMaxConnections' && !superadmin) return `Only the superadmin can change listenerMaxConnections\n`;
-		if (args[0] === 'listenerMaxClientDormancy' && !superadmin) return `Only the superadmin can change listenerMaxClientDormancy\n`;
-		if (args[0] === 'listeningPort' && !superadmin) return `Only the superadmin can change listeningPort\n`;
-		if (args[0] === 'consolePort' && !superadmin) return `Only the superadmin can change consolePort\n`;
-		if (args[0] === 'worldMapW' && !(100 <= value && value <= 32767)) return `worldMapW must be between 100 and 32767\n`;
-		if (args[0] === 'worldPlayerBotsPerWorld' && !(0 <= value && value <= 1000)) return `worldPlayerBotsPerWorld must be between 0 and 1000\n`;
-		if (args[0] === 'worldMinionsPerPlayer' && !(0 <= value && value <= 2500)) return `worldMinionsPerPlayer must be between 0 and 2500\n`;
-		if (args[0] === 'worldMaxMinions' && !(0 <= value && value <= 2500)) return `worldMaxMinions must be between 0 and 2500\n`;
-		if (args[0] === 'minionName' && !superadmin) return `Only the superadmin can change minionName\n`;
-		if (args[0] === 'minionSpawnSize' && !(40 <= value && value <= 2500)) return `minionSpawnSize must be between 40 and 2500\n`;
-		if (args[0] === 'pelletMinSize' && !(1 <= value && value < 40)) return `pelletMinSize must be between 1 and 39\n`;
-		if (args[0] === 'pelletCount' && !(0 <= value && value <= 100000)) return `pelletCount must be between 0 and 100000\n`;
-		if (args[0] === 'virusMinCount' && !(0 <= value && value <= setting.virusMaxCount)) return `virusMinCount must be between 0 and virusMaxCount\n`;
-		if (args[0] === 'virusMaxCount' && !(0 <= value && value <= 10000)) return `virusMaxCount must be between 0 and 10000\n`;
-		if (args[0] === 'virusSize' && !(1 <= value && value <= 2500)) return `virusSize must be between 1 and 2500\n`;
-		if (args[0] === 'virusFeedTimes' && !(1 <= value && value <= 100)) return `virusFeedTimes must be between 1 and 100\n`;
-		if (args[0] === 'virusSplitBoost' && !(0 <= value && value <= 10000)) return `virusSplitBoost must be between 0 and 10000\n`;
-		if (args[0] === 'ejectedSize' && !(1 <= value && value <= 2500)) return `ejectedSize must be between 1 and 2500\n`;
-		if (args[0] === 'ejectingLoss' && !(1 <= value && value <= settings.playerMinEjectSize - 1)) return `ejectingLoss must be between 1 and (playerMinEjectSize - 1)\n`;
-		// (nothing for ejectDispersion)
-		if (args[0] === 'ejectedCellBoost' && !(0 <= value && value <= 10000)) return `ejectedCellBoost must be between 0 and 10000\n`;
-		if (args[0] === 'playerRoamSpeed' && !(1 <= value && value <= 1000)) return `playerRoamSpeed must be between 1 and 1000\n`;
-		if (args[0] === 'playerRoamViewScale' && !(0.01 <= value && value < 0.4)) return `playerRoamViewScale must be between 0.01 and 0.4\n`;
-		if (args[0] === 'playerViewScaleMult' && !(1 <= value && value <= 2)) return `playerViewScaleMult must be between 1 and 2\n`;
-		if (args[0] === 'playerMinSize' && !(40 <= value && value <= 2500)) return `playerMinSize must be between 40 and 2500\n`;
-		if (args[0] === 'playerSpawnSize' && !(40 <= value && value <= 10000)) return `playerSpawnSize must be between 40 and 10000\n`;
-		if (args[0] === 'playerMaxSize' && !(40 <= value && value <= 10000)) return `playerMaxSize must be between 40 and 10000\n`;
-		if (args[0] === 'playerMinSplitSize' && !(40 <= value && value <= 2500)) return `playerMinSplitSize must be between 40 and 2500\n`;
-		if (args[0] === 'playerMinEjectSize' && !(settings.ejectingLoss + 1 <= value && value <= 2500)) return `playerMinEjectSize must be between (ejectingLoss + 1) and 2500\n`;
-		if (args[0] === 'playerEjectDelay' && !(0 <= value && value <= 25)) return `playerEjectDelay must be between 0 and 25\n`;
-		if (args[0] === 'playerMaxCells' && !(1 <= value && value <= 1024)) return `playerMaxCells must be between 1 and 1024\n`;
-		if (args[0] === 'playerMoveMult' && !(0 <= value && value <= 25)) return `playerMoveMult must be between 0 and 25\n`;
-		if (args[0] === 'playerSplitDistance' && !(0 <= value && value <= 1000)) return `playerSplitDistance must be between 0 and 1000\n`;
-		if (args[0] === 'playerSplitBoost' && !(0 <= value && value <= 10000)) return `playerSplitBoost must be between 0 and 10000\n`;
-		if (args[0] === 'playerNoCollideDelay' && !(0 <= value && value <= 100)) return `playerNoCollideDelay must be between 0 and 100\n`;
-		if (args[0] === 'playerMergeTime' && !(0 <= value && value <= 3600)) return `playerMergeTime must be between 0 and 3600\n`;
-		if (args[0] === 'playerMergeTimeIncrease' && !(0 <= value && value <= 1)) return `playerMergeTimeIncrease must be between 0 and 1\n`;
-		if (args[0] === 'playerDecayMult' && !(0 <= value && value <= 0.5)) return `playerDecayMult must be between 0 and 0.5\n`;
-
-		const old = settings[args[0]];
-		settings[args[0]] = value;
-		return `${args[0]} : ${old} -> ${value}\n`;
-	} else if (cmd === 'stats') {
-		const output = [];
-
-		const averages = [];
-		let avgTickTime = 0;
-		for (const frame of metricsMeasurements) {
-			for (let i = 0; i < frame.points.length; ++i) {
-				averages[i] = (averages[i] ?? 0) + frame.points[i];
-			}
-			avgTickTime += frame.time;
-		}
-		avgTickTime /= metricsMeasurements.length;
-		output.push(`load:   ${avgTickTime.toFixed(2)} ms / 40 ms (${(avgTickTime * 2.5).toFixed(2)}%)\n`);
-		for (let i = 0; i < metricsPointsLabels.length; ++i) {
-			output.push(`     -> ${(averages[i] / metricsMeasurements.length).toFixed(2)} ms (${metricsPointsLabels[i]})\n`);
-		}
-
-		const memory = process.memoryUsage();
-		const pretty = value => {
-			const units = ["B", "kiB", "MiB", "GiB", "TiB"]; let i = 0;
-		    for (; i < units.length && value / 1024 > 1; i++)
-		        value /= 1024;
-		    return `${value.toFixed(1)} ${units[i]}`;
-		};
-		output.push(`memory: ${pretty(memory.heapUsed)} / ${pretty(memory.heapTotal)} / ${pretty(memory.rss)} / ${pretty(memory.external)}\n`);
-
-		const uptimeValue = performance.now() / 1000;
-		let uptime = `${~~(uptimeValue % 60)}s`;
-		if (uptimeValue >= 60) uptime = `${~~(uptimeValue / 60 % 60)}m ${uptime}`;
-		if (uptimeValue >= 3600) uptime = `${~~(uptimeValue / 3600 % 24)}h ${uptime}`;
-		if (uptimeValue >= 86400) uptime = `${~~(uptimeValue / 86400)}d ${uptime}`;
-		output.push(`uptime: ${uptime}\n`);
-
-		let realPellets = 0, realViruses = 0, realEjects = 0, realPlayerCells = 0, realCells = 0;
-		let playing = 0, spectating = 0, idle = 0, minions = 0, bots = 0;
-		bitgridSearch(0, 31, 0, 31, cell => {
-			++realCells;
-			if (cell.type === CELL_TYPE_PELLET) ++realPellets;
-			else if (cell.type === CELL_TYPE_PLAYER) ++realPlayerCells;
-			else if (cell.type === CELL_TYPE_EJECT) ++realEjects;
-			else if (cell.type === CELL_TYPE_VIRUS) ++realViruses;
-		});
-		for (const player of players) {
-			if (player.minionCommander) ++minions;
-			else if (player.bot) ++bots;
-			else if (player.state === PLAYER_STATE_ROAM || player.state === PLAYER_STATE_SPECTATE) ++spectating;
-			else if (player.state === PLAYER_STATE_PLAYING) ++playing;
-			else ++idle;
-		}
-		output.push(`${realCells} cells - ${realPlayerCells} player cells, ${realPellets}(${pellets}) pellets, ${realEjects} ejects, ${realViruses}(${viruses}) viruses\n`);
-		output.push(`${playing} playing - ${spectating} spectating - ${idle} idle - ${minions} minions - ${bots} bots\n`);
-
-		return output.join('');
-	} else {
-		return `unknown command ${cmd}\n`;
+		})());
 	}
+
+	return lines.join('');
 };
 
 const commandStream = readline.createInterface({
