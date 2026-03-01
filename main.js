@@ -687,26 +687,26 @@ const worldTick = () => {
 	// now update players
 	// compile leaderboard, or at least find the largest player
 	const leaderboard = [];
-	let largestPlayer, largestPlayerMass = 0;
-	if (now % 4 === 0) {
+	if (now % settings.leaderboardUpdateDelay === 0) {
 		for (const player of players.values()) {
 			if (player.minionCommander) continue;
+			if (!settings.leaderboardShowBots && player.bot) continue;
+
 			let mass = 0;
 			for (const cell of player.owned) {
 				mass += cell.r * cell.r;
 			}
-			if (mass) leaderboard.push({ player, mass });
+			if (mass) leaderboard.push({ player, mass: mass / 100 });
 		}
 		leaderboard.sort((a, b) => b.mass - a.mass);
-		largestPlayer = leaderboard[0]?.player;
-		largestPlayerMass = leaderboard[0]?.mass || 0;
-	} else {
-		for (const player of players.values()) {
-			if (player.minionCommander) continue;
-			let mass = 0;
-			for (const cell of player.owned) mass += cell.r * cell.r;
-			if (mass > largestPlayerMass) [largestPlayer, largestPlayerMass] = [player, mass];
-		}
+	}
+
+	let largestPlayer, largestPlayerMass = 0; // leaderboard may not include bots, which may be the biggest
+	for (const player of players.values()) {
+		if (player.minionCommander) continue;
+		let mass = 0;
+		for (const cell of player.owned) mass += cell.r * cell.r;
+		if (mass > largestPlayerMass) [largestPlayer, largestPlayerMass] = [player, mass];
 	}
 
 	for (const player of players.values()) {
@@ -985,6 +985,55 @@ const worldTick = () => {
 
 	tickMeasurement('con1');
 
+	for (const player of players.values()) {
+		if (!player.ws) continue;
+
+		// leaderboard (must be recomputed for every player, because of "myPosition")
+		let o = 0;
+		if (now % settings.leaderboardUpdateDelay === 0) {
+			writerU8[o++] = 0x31;
+			const length = Math.min(leaderboard.length, settings.leaderboardMaxLength);
+			const extraLines = [];
+			let myPosition = -1;
+			if (settings.leaderboardTeamBanner) {
+				// TODO: make this real
+				extraLines.push({ red: true, sub: false, line: '┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━' });
+				extraLines.push({ red: true, sub: false, line: '┃ 00:00 ◇ 1-0             ' });
+				extraLines.push({ red: true, sub: false, line: '┃ T1 73.8%             ' });
+				extraLines.push({ red: true, sub: false, line: '┃ T2 26.2%             ' });
+				extraLines.push({ red: true, sub: false, line: '┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━' });
+			} else {
+				// if the team banner is open, do not use myPosition, don't show any off-lb players
+				leaderboard.findIndex(entry => entry.player === player) || 0; // 0 if not found
+			}
+
+			(writerDat.setUint32(o, length + extraLines.length, true), o += 4);
+			for (let i = 0; i < length; ++i) {
+				const { player: lbPlayer, mass } = leaderboard[i];
+				(writerDat.setUint32(o, lbPlayer === player ? 1 : 0, true), o += 4);
+				if (settings.leaderboardShowMass) {
+					const encoded = textEncoder.encode(
+						'(' + (mass > 1000 ? (mass / 1000).toFixed(1) + 'k' : String(~~mass)) + ') ');
+					(writerU8.set(encoded, o), o += encoded.length); // not null-terminated
+				}
+				(writerU8.set(lbPlayer.nameU8, o), o += lbPlayer.nameU8.length);
+				(writerDat.setUint32(o, myPosition + 1, true), o += 4); // sigmally
+				(writerDat.setUint32(o, lbPlayer.sub ? 1 : 0, true), o += 4); // sigmally
+			}
+
+			for (const { red, sub, line } of extraLines) {
+				const encoded = textEncoder.encode(line);
+				(writerDat.setUint32(o, red ? 1 : 0, true), o += 4);
+				(writerU8.set(encoded, o), o += encoded.length);
+				writerU8[o++] = 0; // null-terminator
+				(writerDat.setUint32(o, 0, true), o += 4); // sigmally
+				(writerDat.setUint32(o, sub ? 1 : 0, true), o += 4); // sigmally
+			}
+
+			void player.ws.send(writerU8.subarray(0, o), true);
+		}
+	}
+
 	let maxEatL = 0, maxAddL = 0, maxUpdL = 0, maxDelL = 0;
 	con2PlayerLoop: for (const player of players.values()) {
 		if (player.disconnectedAt || player.minionCommander || player.bot) continue;
@@ -993,25 +1042,6 @@ const worldTick = () => {
 		if (!visibleCells) continue; // could happen if the player was just in limbo
 
 		const oldVisibleCells = player.visibleCells;
-
-		// leaderboard (must be recomputed for every player, because of "myPosition")
-		let o = 0;
-		if (now % 4 === 0) {
-			writerU8[o++] = 0x31;
-			const length = Math.min(leaderboard.length, 10);
-			const myPosition = leaderboard.findIndex(entry => entry.player === player) || 0; // 0 if not found
-
-			(writerDat.setUint32(o, length, true), o += 4);
-			for (let i = 0; i < length; ++i) {
-				const { player: lbPlayer } = leaderboard[i];
-				(writerDat.setUint32(o, lbPlayer === player ? 1 : 0, true), o += 4);
-				(writerU8.set(lbPlayer.nameU8, o), o += lbPlayer.nameU8.length);
-				(writerDat.setUint32(o, myPosition + 1, true), o += 4); // sigmally
-				(writerDat.setUint32(o, lbPlayer.sub ? 1 : 0, true), o += 4); // sigmally
-			}
-
-			void player.ws.send(writerU8.subarray(0, o), true);
-		}
 
 		// the new Set.prototype.difference and .intersection functions are only faster if the two sets are very
 		// disjoint, but usually they aren't (a player can't move that far between ticks)
@@ -1062,7 +1092,7 @@ const worldTick = () => {
 		}
 
 		// update packet
-		o = 0;
+		let o = 0;
 		writerU8[o++] = 0x10;
 		(writerDat.setUint16(o, eatL, true), o += 2);
 		for (let i = 0; i < eatL; ++i) {
@@ -1152,7 +1182,7 @@ const worldTick = () => {
 					&& d - splitDistance <= leader.r - cell.r * WORLD_EAT_OVERLAP_MULT;
 				const canEat = leader.r >= cell.r * WORLD_EAT_MULT;
 				if (cell.type === CELL_TYPE_PLAYER) {
-					if (cell.owner !== player) {
+					if (cell.owner !== player && !settings.worldPlayerBotIgnorePlayers) {
 						if (canEat) {
 							influence = truncatedInfluence;
 							if (canSplitKill && (!bestPrey || cell.r > bestPrey.r)) bestPrey = cell;
@@ -1806,7 +1836,7 @@ const command = (line, superadmin) => {
 				if (args[0] === 'pelletMinSize' && !(1 <= value && value < 40)) return `pelletMinSize must be between 1 and 39\n`;
 				if (args[0] === 'pelletCount' && !(0 <= value && value <= 100000)) return `pelletCount must be between 0 and 100000\n`;
 				if (args[0] === 'virusMinCount' && !(0 <= value && value <= setting.virusMaxCount)) return `virusMinCount must be between 0 and virusMaxCount\n`;
-				if (args[0] === 'virusMaxCount' && !(0 <= value && value <= 10000)) return `virusMaxCount must be between 0 and 10000\n`;
+				if (args[0] === 'virusMaxCount' && !(settings.virusMinCount <= value && value <= 10000)) return `virusMaxCount must be between virusMinCount and 10000\n`;
 				if (args[0] === 'virusSize' && !(1 <= value && value <= 2500)) return `virusSize must be between 1 and 2500\n`;
 				if (args[0] === 'virusFeedTimes' && !(1 <= value && value <= 100)) return `virusFeedTimes must be between 1 and 100\n`;
 				if (args[0] === 'virusSplitBoost' && !(0 <= value && value <= 10000)) return `virusSplitBoost must be between 0 and 10000\n`;

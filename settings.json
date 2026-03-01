@@ -9,6 +9,7 @@
     "worldMapW": 17071,
     "worldPlayerDisposeDelay": 1500,
     "worldPlayerBotsPerWorld": 40,
+    "worldPlayerBotIgnorePlayers": false,
     "worldPlayerBotNames": [
         "{*}Valeriy",
         "{*}Mtch",
@@ -85,5 +86,10 @@
     "playerNoCollideDelay": 13,
     "playerMergeTime": 30,
     "playerMergeTimeIncrease": 0.02,
-    "playerDecayMult": 0.009
+    "playerDecayMult": 0.009,
+    "leaderboardMaxLength": 10,
+    "leaderboardShowMass": false,
+    "leaderboardShowBots": true,
+    "leaderboardTeamBanner": false,
+    "leaderboardUpdateDelay": 4
 }
