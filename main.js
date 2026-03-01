@@ -1797,7 +1797,7 @@ const command = (line, superadmin) => {
 				return `Server: ${message}\n`;
 			} else if (cmd === 'setting') {
 				if (!args[0]) {
-					return `All settings: ${Object.keys(settings).join(', ')}\n`;
+					return `All settings: ${Object.entries(settings).map(kv => kv.join('=')).join(', ')}\n`;
 				}
 				if (!(args[0] in settings)) return `setting "${args[0]}" not found\n`;
 				if (!args[1]) {
@@ -1819,7 +1819,7 @@ const command = (line, superadmin) => {
 				} else if (typeof settings[args[0]] === 'string') {
 					value = args[1] === '-' ? '' : args[1];
 				} else {
-					return `this setting cannot be changed\n`;
+					return `Only the superadmin can change ${args[0]}\n`;
 				}
 
 				// i might be a little dumb for writing this LOL
