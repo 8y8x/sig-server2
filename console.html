@@ -15,7 +15,7 @@
 		};
 		put(`You need a key to access the sig-server2 console for ${location.hostname}.`);
 		put(`If you're hosting a tournament or other event, ask yx for a key.`);
-		put(`Then enter it in the box down at the bottom:`);
+		put(`Then enter it in the box down at the bottom.`);
 
 		let ws = { readyState: 3 };
 
@@ -40,9 +40,15 @@
 					return;
 				}
 				ws.binaryType = 'arraybuffer';
+
+				let timeout = setTimeout(() => {
+					put('Can\'t reach the server, try again later?');
+				}, 3000);
+
 				let opened = false;
 				ws.addEventListener('close', () => {
-					if (opened) put(`Disconnected. Enter your key to reconnect:`);
+					clearTimeout(timeout);
+					if (opened) put(`Disconnected. Enter your key to reconnect.`);
 					else put(`Incorrect key, try again:`);
 				});
 				ws.addEventListener('message', m => {
@@ -50,6 +56,7 @@
 					output.scrollTop = output.scrollHeight; 
 				});
 				ws.addEventListener('open', () => {
+					clearTimeout(timeout);
 					opened = true;
 					put(`Connection opened! Type 'help' for a list of commands.`);
 				});

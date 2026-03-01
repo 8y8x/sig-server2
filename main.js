@@ -144,7 +144,7 @@ const metricsMeasurements = [];
 
 const boostingCells = [];
 const playerCells = [];
-const players = new Set();
+const players = new Map();
 const playerBotAi = new WeakMap();
 let connections = 0;
 let nextCellId = 1;
@@ -162,6 +162,44 @@ for (let shade = 0; shade < 256; ++shade) {
 		0x0010ff | (shade << 16), 0x00ff10 | (shade << 16), // random blue component
 	], shade * 6);
 }
+
+const addPlayer = playerSkeleton => {
+	let id;
+	const maxId = players.size <= 500 ? 1000 : settings.listenerMaxConnections + settings.worldMaxMinions * 2;
+	do {
+		id = ~~(Math.random() * maxId);
+	} while (players.has(id));
+
+	const player = {
+		bot: false,
+		camera: { x: 0, y: 0, scale: 1 },
+		chatAt: now,
+		clanU8: EMPTY_STRING_U8,
+		disconnectedAt: 0,
+		id: 'p' + String(id).padStart(3, '0'),
+		lastW: 0,
+		minionCommander: undefined,
+		mouseX: 0,
+		mouseY: 0,
+		nameU8: EMPTY_STRING_U8,
+		owned: new Set(),
+		rgb: 0x7f7f7f,
+		q: false,
+		showClanmates: false,
+		skinU8: EMPTY_STRING_U8,
+		spawn: undefined,
+		splits: 0,
+		state: PLAYER_STATE_IDLE,
+		sub: false,
+		updated: now,
+		visibleCells: new Set(),
+		w: false,
+		ws: undefined,
+		...playerSkeleton,
+	};
+	players.set(player.id, player);
+	return player;
+};
 
 const bounce = (cell, fromBoost) => {
 	const r = cell.r / 2;
@@ -365,7 +403,7 @@ const worldTick = () => {
 		writerDat.setFloat64(9, -realMapWidth, true);
 		writerDat.setFloat64(17, realMapWidth, true);
 		writerDat.setFloat64(25, realMapWidth, true);
-		for (const player of players) {
+		for (const player of players.values()) {
 			if (player.ws) void player.ws.send(writerU8.subarray(0, 33), true);
 		}
 	}
@@ -651,7 +689,7 @@ const worldTick = () => {
 	const leaderboard = [];
 	let largestPlayer, largestPlayerMass = 0;
 	if (now % 4 === 0) {
-		for (const player of players) {
+		for (const player of players.values()) {
 			if (player.minionCommander) continue;
 			let mass = 0;
 			for (const cell of player.owned) {
@@ -663,7 +701,7 @@ const worldTick = () => {
 		largestPlayer = leaderboard[0]?.player;
 		largestPlayerMass = leaderboard[0]?.mass || 0;
 	} else {
-		for (const player of players) {
+		for (const player of players.values()) {
 			if (player.minionCommander) continue;
 			let mass = 0;
 			for (const cell of player.owned) mass += cell.r * cell.r;
@@ -671,7 +709,7 @@ const worldTick = () => {
 		}
 	}
 
-	for (const player of players) {
+	for (const player of players.values()) {
 		if (player.disconnectedAt) {
 			if (player.state === PLAYER_STATE_PLAYING && now - player.disconnectedAt > settings.worldPlayerDisposeDelay) {
 				j = 0; // remove player's cells
@@ -684,11 +722,11 @@ const worldTick = () => {
 					}
 				}
 				playerCells.length = j;
-				players.delete(player);
+				players.delete(player.id);
 				player.owned.clear();
 				player.state = PLAYER_STATE_IDLE;
 			} else if (player.state !== PLAYER_STATE_PLAYING) {
-				players.delete(player);
+				players.delete(player.id);
 				player.state = PLAYER_STATE_IDLE;
 			}
 		} else {
@@ -809,7 +847,7 @@ const worldTick = () => {
 	}
 
 	// do this afterwards, to make sure largestPlayer.camera is up-to-date
-	for (const player of players) {
+	for (const player of players.values()) {
 		if (player.state === PLAYER_STATE_SPECTATE) player.camera = largestPlayer.camera;
 	}
 
@@ -817,7 +855,7 @@ const worldTick = () => {
 	let playingExternal = 0;
 	let playingInternal = 0;
 	let spectating = 0;
-	for (const player of players) {
+	for (const player of players.values()) {
 		if (player.minionCommander || player.bot) ++playingInternal;
 		else if (player.state === PLAYER_STATE_PLAYING) ++playingExternal;
 		else if (player.state === PLAYER_STATE_ROAM || player.state === PLAYER_STATE_SPECTATE) ++spectating;
@@ -834,7 +872,7 @@ const worldTick = () => {
 
 	const minionsPerPlayer = new Map();
 	// remove extra minions
-	for (const player of players) {
+	for (const player of players.values()) {
 		if (!player.minionCommander) continue;
 		let minions = minionsPerPlayer.get(player.minionCommander) || 0;
 		if (minions > targetMinionsPerPlayer || player.minionCommander.state !== PLAYER_STATE_PLAYING) {
@@ -845,40 +883,18 @@ const worldTick = () => {
 	}
 
 	// add new minions
-	for (const player of players) {
+	for (const player of players.values()) {
 		if (player.minionCommander || player.bot) continue;
 		if (player.state !== PLAYER_STATE_PLAYING) continue;
 		let minions = minionsPerPlayer.get(player) || 0;
 		for (; minions < targetMinionsPerPlayer; ++minions) {
-			players.add({
-				bot: false,
-				camera: { x: 0, y: 0, scale: 1 },
-				clanU8: EMPTY_STRING_U8,
-				disconnectedAt: 0,
-				lastW: 0,
-				minionCommander: player,
-				mouseX: 0,
-				mouseY: 0,
-				nameU8: EMPTY_STRING_U8,
-				owned: new Set(),
-				rgb: 0x7f7f7f,
-				q: false,
-				showClanmates: false,
-				skinU8: EMPTY_STRING_U8,
-				spawn: undefined,
-				splits: 0,
-				state: PLAYER_STATE_IDLE,
-				sub: false,
-				updated: now,
-				visibleCells: new Set(),
-				w: false,
-			});
+			addPlayer({ minionCommander: player });
 		}
 	}
 
 	// add/remove extra player bots
 	let playerBots = 0;
-	for (const player of players) {
+	for (const player of players.values()) {
 		if (player.bot) {
 			if (playerBots >= settings.worldPlayerBotsPerWorld) player.disconnectedAt = -Infinity;
 			else ++playerBots;
@@ -886,29 +902,7 @@ const worldTick = () => {
 	}
 
 	for (; playerBots < settings.worldPlayerBotsPerWorld; ++playerBots) {
-		players.add({
-			bot: true,
-			camera: { x: 0, y: 0, scale: 1 },
-			clanU8: EMPTY_STRING_U8,
-			disconnectedAt: 0,
-			minionCommander: undefined,
-			mouseX: 0,
-			mouseY: 0,
-			lastW: 0,
-			nameU8: EMPTY_STRING_U8,
-			owned: new Set(),
-			rgb: 0x7f7f7f,
-			q: false,
-			showClanmates: false,
-			skinU8: EMPTY_STRING_U8,
-			spawn: undefined,
-			splits: 0,
-			state: PLAYER_STATE_IDLE,
-			sub: false,
-			updated: now,
-			visibleCells: new Set(),
-			w: false,
-		});
+		addPlayer({ bot: true });
 	}
 
 	tickMeasurement('cells3');
@@ -940,7 +934,7 @@ const worldTick = () => {
 
 	// #2 update connections
 	const newVisibleCells = new Map();
-	for (const player of players) {
+	for (const player of players.values()) {
 		if (player.disconnectedAt) continue;
 		if (now - player.updated >= settings.listenerMaxClientDormancy / 40) {
 			if (!player.bot && !player.minionCommander) player.ws.close();
@@ -992,7 +986,7 @@ const worldTick = () => {
 	tickMeasurement('con1');
 
 	let maxEatL = 0, maxAddL = 0, maxUpdL = 0, maxDelL = 0;
-	con2PlayerLoop: for (const player of players) {
+	con2PlayerLoop: for (const player of players.values()) {
 		if (player.disconnectedAt || player.minionCommander || player.bot) continue;
 
 		const visibleCells = newVisibleCells.get(player.camera);
@@ -1097,7 +1091,7 @@ const worldTick = () => {
 
 	tickMeasurement('con2');
 
-	for (const player of players) {
+	for (const player of players.values()) {
 		if (!player.bot || player.disconnectedAt) continue;
 
 		const visibleCells = newVisibleCells.get(player.camera);
@@ -1228,14 +1222,6 @@ const SIG_HANDSHAKE_U8 = new Uint8Array(SIG_VERSION_STRING_U8.length + 256);
 SIG_HANDSHAKE_U8.set(SIG_VERSION_STRING_U8);
 for (let i = 0, o = SIG_VERSION_STRING_U8.length; i < 256; ++i, ++o) SIG_HANDSHAKE_U8[o] = i;
 
-const BORDER_UPDATE_PACKET_DAT = new DataView(new ArrayBuffer(33));
-BORDER_UPDATE_PACKET_DAT.setUint8(0, 0x40);
-BORDER_UPDATE_PACKET_DAT.setFloat64(1, -realMapWidth, true);
-BORDER_UPDATE_PACKET_DAT.setFloat64(9, -realMapWidth, true);
-BORDER_UPDATE_PACKET_DAT.setFloat64(17, realMapWidth, true);
-BORDER_UPDATE_PACKET_DAT.setFloat64(25, realMapWidth, true);
-const BORDER_UPDATE_PACKET_U8 = new Uint8Array(BORDER_UPDATE_PACKET_DAT.buffer);
-
 const SERVER_NAME_U8 = encodeUtf8AsU8('Server');
 const SPECTATOR_NAME_U8 = encodeUtf8AsU8('Spectator');
 // caching utf8 probably is not that necessary, but it's cool, so why not
@@ -1293,37 +1279,18 @@ uws.App()
 					if (u8[i] !== SIG_VERSION_STRING_U8[i]) return client.end(1003, 'Ambiguous protocol');
 				}
 
-				const newPlayer = {
-					bot: false,
-					camera: { x: 0, y: 0, scale: 1 },
-					chatAt: now,
-					clanU8: EMPTY_STRING_U8,
-					disconnectedAt: 0,
-					lastW: 0,
-					minionCommander: undefined,
-					mouseX: 0,
-					mouseY: 0,
-					nameU8: EMPTY_STRING_U8,
-					owned: new Set(),
-					q: false,
-					rgb: 0x7f7f7f,
-					showClanmates: false,
-					skinU8: EMPTY_STRING_U8,
-					spawn: undefined,
-					splits: 0,
-					state: PLAYER_STATE_IDLE,
-					sub: false,
-					updated: now,
-					visibleCells: new Set(),
-					w: false,
-					ws: client,
-				};
-				players.add(newPlayer);
-				client.getUserData().player = newPlayer;
+				const player = addPlayer({ ws: client });
+				client.getUserData().player = player;
 
 				client.cork(() => { // TODO am i corking correctly?
 					void client.send(SIG_HANDSHAKE_U8, true);
-					void client.send(BORDER_UPDATE_PACKET_U8, true);
+
+					writerU8[0] = 0x40; // border update
+					writerDat.setFloat64(1, -realMapWidth, true);
+					writerDat.setFloat64(9, -realMapWidth, true);
+					writerDat.setFloat64(17, realMapWidth, true);
+					writerDat.setFloat64(25, realMapWidth, true);
+					void client.send(writerU8.subarray(0, 33), true);
 				});
 				return;
 			}
@@ -1448,7 +1415,7 @@ uws.App()
 					player.nameU8 === EMPTY_STRING_U8 ? SPECTATOR_NAME_U8 : player.nameU8,
 					encodeUtf8AsU8(trimmed),
 				);
-				for (const otherPlayer of players) {
+				for (const otherPlayer of players.values()) {
 					if (otherPlayer.ws) void otherPlayer.ws.send(packet, true);
 				}
 				// TODO there should be a better way to print chat messages
@@ -1563,24 +1530,234 @@ const command = (line, superadmin) => {
 					lines.push(`${i++}. ${key} - ${val}\n`);
 				}
 				return lines.join('');
+			} else if (cmd === 'kill') {
+				if (!args[0]) return `Specify a player ID to kill - kill <id>\n`;
+				const player = players.get(args[0]);
+				if (!player) return `No player with ID "${args[0]}" found\n`;
+
+				let score = 0;
+				for (const cell of player.owned) score += cell.r * cell.r;
+				score /= 100;
+				const stringifiedScore = score >= 1000 ? (score / 1000).toFixed(1) + 'k' : ~~score;
+
+				if (player.state === PLAYER_STATE_PLAYING) {
+					for (const cell of player.owned) bitgridRemove(cell);
+					player.owned.clear();
+					
+					let j = 0;
+					for (let i = 0, l = playerCells.length; i < l; ++i) {
+						playerCells[j] = playerCells[i];
+						if (playerCells[i].owner !== player) ++j;
+					}
+					playerCells.length = j;
+
+					j = 0;
+					for (let i = 0, l = boostingCells.length; i < l; ++i) {
+						boostingCells[j] = boostingCells[i];
+						if (boostingCells[i].owner !== player) ++j;
+					}
+					boostingCells.length = j;
+					player.state = PLAYER_STATE_IDLE;
+				}
+				return `Killed player ${textDecoder.decode(player.nameU8)} (${stringifiedScore})\n`;
+			} else if (cmd === 'kill-all') {
+				for (const player of players.values()) player.owned.clear();
+				for (const cell of playerCells) bitgridRemove(cell);
+				playerCells.length = 0;
+
+				let j = 0;
+				for (let i = 0, l = boostingCells.length; i < l; ++i) {
+					boostingCells[j] = boostingCells[i];
+					if (boostingCells[i].owner === PLAYER_OWNER_SERVER) ++j;
+				}
+				boostingCells.length = j;
+
+				for (const player of players.values()) {
+					if (player.state === PLAYER_STATE_PLAYING) player.state = PLAYER_STATE_IDLE;
+				}
+				return `Killed all players\n`;
+			} else if (cmd === 'mass') {
+				if (!args[0]) return `Specify a player ID to give mass - mass <id> <mass>\n`;
+				const player = players.get(args[0]);
+				if (!player) return `No player with ID "${args[0]}" found\n`;
+
+				if (!args[1]) return `Specify mass to give - mass <id> <mass>\n`;
+				const targetMass = Number(args[1]);
+				if (Number.isNaN(targetMass)) return `Mass "${args[1]}" is invalid\n`;
+				if (!(0 <= targetMass && targetMass <= 10000000)) return `Mass must be between 0 and 10,000,000\n`;
+
+				let score = 0;
+				for (const cell of player.owned) score += cell.r * cell.r;
+				score /= 100;
+
+				if (score === 0) {
+					// forcefully spawn the player
+					if (player.spawn) {
+						player.nameU8 = player.spawn.nameU8;
+						player.skinU8 = player.spawn.skinU8;
+						player.sub = player.spawn.sub;
+					}
+					player.state = PLAYER_STATE_PLAYING;
+
+					const r = Math.sqrt(targetMass * 100);
+
+					const spawnSize = player.minionCommander ? settings.minionSpawnSize : settings.playerSpawnSize;
+					const [x, y] = safeSpawnPos(spawnSize);
+					const rgb = player.rgb = randomColors[~~(Math.random() * 256 * 6)];
+					const cell = add({ type: CELL_TYPE_PLAYER, x, y, r, rgb, owner: player });
+					player.owned.add(cell);
+					playerCells.push(cell);
+					return;
+				}
+
+				const radiusMultiplier = Math.sqrt(targetMass / score);
+				for (const cell of player.owned) {
+					cell.r *= radiusMultiplier;
+					bitgridUpdate(cell);
+					cell.moved = now;
+					encode(cell);
+				}
+
+				return `Player ${textDecoder.decode(player.nameU8)} now has ${targetMass} mass\n`;
+			} else if (cmd === 'mass-all') {
+				if (!args[0]) return `Specify mass to give - mass-all <mass>\n`;
+				const targetMass = Number(args[0]);
+				if (Number.isNaN(targetMass)) return `Mass "${args[0]}" is invalid\n`;
+				if (!(0 <= targetMass && targetMass <= 10000000)) return `Mass must be between 0 and 10,000,000\n`;
+
+				let givenPlayers = 0;
+				for (const player of players.values()) {
+					if (player.bot || player.minionCommander) continue;
+
+					let score = 0;
+					for (const cell of player.owned) score += cell.r * cell.r;
+					score /= 100;
+					if (score === 0) continue;
+
+					const radiusMultiplier = Math.sqrt(targetMass / score);
+					for (const cell of player.owned) {
+						cell.r *= radiusMultiplier;
+						bitgridUpdate(cell);
+						cell.moved = now;
+						encode(cell);
+					}
+					++givenPlayers;
+				}
+
+				return `${givenPlayers} players now have ${targetMass} mass\n`;
+			} else if (cmd === 'merge' || cmd === 'merge-all') {
+				const merge = player => {
+					let score = 0;
+					let biggestCell;
+					for (const cell of player.owned) {
+						score += cell.r * cell.r;
+						if (!biggestCell || cell.r > biggestCell.r) biggestCell = cell;
+					}
+
+					if (biggestCell) {
+						biggestCell.r = Math.sqrt(score);
+						bitgridUpdate(biggestCell);
+						biggestCell.moved = now;
+						encode(biggestCell);
+						for (const cell of player.owned) {
+							if (cell === biggestCell) continue;
+							cell.deadTo = biggestCell.id;
+							bitgridRemove(cell);
+							player.owned.delete(cell);
+						}
+
+						let j = 0;
+						for (let i = 0, l = playerCells.length; i < l; ++i) {
+							playerCells[j] = playerCells[i];
+							if (playerCells[i].owner !== player || !playerCells[i].deadTo) ++j;
+						}
+						playerCells.length = j;
+
+						j = 0;
+						for (let i = 0, l = boostingCells.length; i < l; ++i) {
+							boostingCells[j] = boostingCells[i];
+							if (boostingCells[i].owner !== player || !playerCells[i].deadTo) ++j;
+						}
+						boostingCells.length = j;
+					}
+				};
+
+				if (cmd === 'merge') {
+					if (!args[0]) return `Specify a player ID to merge - merge <id>\n`;
+					const player = players.get(args[0]);
+					if (!player) return `No player with ID "${args[0]}" found\n`;
+
+					merge(player);
+					return `Merged player ${textDecoder.decode(player.nameU8)}\n`;
+				} else {
+					for (const player of players.values()) {
+						if (player.minionCommander) continue;
+						merge(player); // merge all bots too
+					}
+
+					return `Merged all players and player bots\n`;
+				}
 			} else if (cmd === 'players') {
-				return 'Todo\n';
+				const realPlayers = [];
+				const bots = [];
+				const score = player => {
+					let mass = 0;
+					for (const cell of player.owned) mass += cell.r * cell.r;
+					return mass / 100;
+				};
+				let spectating = 0, roaming = 0, idle = 0;
+				for (const player of players.values()) {
+					if (player.minionCommander) continue;
+					if (player.bot) { bots.push([player, score(player)]); continue; }
+
+					if (player.state === PLAYER_STATE_IDLE) ++idle;
+					else if (player.state === PLAYER_STATE_ROAM) ++roaming;
+					else if (player.state === PLAYER_STATE_SPECTATE) ++spectating;
+
+					// include all playing, and anyone spectating that has a name (i.e. not auto-spectate tab)
+					if (player.state === PLAYER_STATE_PLAYING) realPlayers.push([player, score(player)]);
+					else if (player.nameU8.length > 2 && (player.state === PLAYER_STATE_SPECTATE
+						|| player.state === PLAYER_STATE_ROAM)) realPlayers.push([player, 0]);
+				}
+
+				realPlayers.sort(([_,a],[__,b]) => b - a);
+				bots.sort(([_,a],[__,b]) => b - a);
+
+				const lines = [];
+				let place = 1;
+				for (const [player, score] of realPlayers) {
+					const stringifiedScore = score >= 1000 ? (score / 1000).toFixed(1) + 'k' : ~~score;
+					lines.push(`${place++}. ${player.id} : ${textDecoder.decode(player.nameU8)} (${stringifiedScore})`);
+				}
+
+				if (bots.length > 3) bots.length = 3;
+				if (bots.length) {
+					lines.push(``, `Top 3 bots: ${bots.map(([player,score]) => {
+						const stringifiedScore = score >= 1000 ? (score / 1000).toFixed(1) + 'k' : ~~score;
+						return `${player.id} ${textDecoder.decode(player.nameU8)} (${stringifiedScore})`;
+					}).join(' / ')}`);
+				}
+
+				lines.push(``, `${spectating} spectating, ${roaming} roaming, ${idle} idle`);
+
+				return lines.join('\n') + '\n';
 			} else if (cmd === 'safeexit') {
 				if (!superadmin) return 'Only the superadmin can run this\n';
 				setInterval(() => {
-					for (const player of players) {
+					for (const player of players.values()) {
 						if (player.minionCommander || player.bot) continue;
 						if (player.state === PLAYER_STATE_PLAYING) return;
 					}
 					process.exit(0);
 				}, 5000);
+				return `The server will exit once all players leave`;
 			} else if (cmd === 'say') {
 				// if using the server flag, then sigfixes will duplicate messages between tabs, so
 				// don't send messages to tabs on the same IP address
 				const message = args.join(' ');
 				const packet = messagePacketU8(0x80, 0xc03f3f, SERVER_NAME_U8, encodeUtf8AsU8(message));
 				const usedAddresses = new Set(); 
-				for (const player of players) {
+				for (const player of players.values()) {
 					if (!player.ws) continue;
 					const address = textDecoder.decode(player.ws.getRemoteAddressAsText());
 					if (usedAddresses.has(address)) continue;
@@ -1700,7 +1877,7 @@ const command = (line, superadmin) => {
 					else if (cell.type === CELL_TYPE_EJECT) ++realEjects;
 					else if (cell.type === CELL_TYPE_VIRUS) ++realViruses;
 				});
-				for (const player of players) {
+				for (const player of players.values()) {
 					if (player.minionCommander) ++minions;
 					else if (player.bot) ++bots;
 					else if (player.state === PLAYER_STATE_ROAM || player.state === PLAYER_STATE_SPECTATE) ++spectating;
@@ -1757,7 +1934,7 @@ setInterval(() => {
 		else if (cell.type === CELL_TYPE_EJECT) ++realEjects;
 		else if (cell.type === CELL_TYPE_VIRUS) ++realViruses;
 	});
-	for (const player of players) {
+	for (const player of players.values()) {
 		if (player.minionCommander) ++minions;
 		else if (player.bot) ++bots;
 		else if (player.state === PLAYER_STATE_ROAM || player.state === PLAYER_STATE_SPECTATE) ++spectating;
