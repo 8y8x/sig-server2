@@ -29,15 +29,16 @@ const encodeUtf8AsU8 = s => {
 
 // undefined behaviour occurs if a cell ever exists beyond the bitgrid, just keep it in mind
 // (the width and height) get all messed up
-const BITGRID_TILE_SIZE = Math.max(2500, (settings.worldMapW * 2 + 3000) / 32);
+let realMapWidth = settings.worldMapW;
+let BITGRID_TILE_SIZE = Math.max(2500, (realMapWidth * 2 + 3000) / 32);
 const bitgridTiles = [];
 for (let i = 0; i < 1024; ++i) bitgridTiles.push(new Set());
 
 const bitgridAdd = cell => {
-	const xmin = ((cell.x + settings.worldMapW - cell.r) / BITGRID_TILE_SIZE) & 0x1f;
-	const xmax = ((cell.x + settings.worldMapW + cell.r) / BITGRID_TILE_SIZE) & 0x1f;
-	const ymin = ((cell.y + settings.worldMapH - cell.r) / BITGRID_TILE_SIZE) & 0x1f;
-	const ymax = ((cell.y + settings.worldMapH + cell.r) / BITGRID_TILE_SIZE) & 0x1f;
+	const xmin = ((cell.x + realMapWidth - cell.r) / BITGRID_TILE_SIZE) & 0x1f;
+	const xmax = ((cell.x + realMapWidth + cell.r) / BITGRID_TILE_SIZE) & 0x1f;
+	const ymin = ((cell.y + realMapWidth - cell.r) / BITGRID_TILE_SIZE) & 0x1f;
+	const ymax = ((cell.y + realMapWidth + cell.r) / BITGRID_TILE_SIZE) & 0x1f;
 	cell.bgXmin = xmin; cell.bgXmax = xmax; cell.bgYmin = ymin; cell.bgYmax = ymax;
 
 	for (let x = xmin; x <= xmax; ++x) {
@@ -49,10 +50,10 @@ const bitgridAdd = cell => {
 
 const bitgridUpdate = cell => {
 	const { bgXmin, bgXmax, bgYmin, bgYmax } = cell;
-	const xmin = ((cell.x + settings.worldMapW - cell.r) / BITGRID_TILE_SIZE) & 0x1f;
-	const xmax = ((cell.x + settings.worldMapW + cell.r) / BITGRID_TILE_SIZE) & 0x1f;
-	const ymin = ((cell.y + settings.worldMapH - cell.r) / BITGRID_TILE_SIZE) & 0x1f;
-	const ymax = ((cell.y + settings.worldMapH + cell.r) / BITGRID_TILE_SIZE) & 0x1f;
+	const xmin = ((cell.x + realMapWidth - cell.r) / BITGRID_TILE_SIZE) & 0x1f;
+	const xmax = ((cell.x + realMapWidth + cell.r) / BITGRID_TILE_SIZE) & 0x1f;
+	const ymin = ((cell.y + realMapWidth - cell.r) / BITGRID_TILE_SIZE) & 0x1f;
+	const ymax = ((cell.y + realMapWidth + cell.r) / BITGRID_TILE_SIZE) & 0x1f;
 	
 	if (xmin === bgXmin && xmax === bgXmax && ymin === bgYmin && ymax === bgYmax) return; // shortcut
 	cell.bgXmin = xmin; cell.bgXmax = xmax; cell.bgYmin = ymin; cell.bgYmax = ymax;
@@ -88,6 +89,7 @@ const bitgridSearch = (xmin, xmax, ymin, ymax, cb) => {
 		for (let y = ymin; y <= ymax; ++y) {
 			for (const cell of bitgridTiles[y * 32 + x]) {
 				// no duplicates
+				// TODO: this still has duplicates. wtf u doin
 				if ((xmin <= cell.bgXmin && cell.bgXmin < x) || (ymin <= cell.bgYmin && cell.bgYmin < y)) continue;
 				if (cb(cell)) return true;
 			}
@@ -163,18 +165,18 @@ for (let shade = 0; shade < 256; ++shade) {
 
 const bounce = (cell, fromBoost) => {
 	const r = cell.r / 2;
-	if (cell.x - r < -settings.worldMapW) {
-		cell.x = -settings.worldMapW + r;
+	if (cell.x - r < -realMapWidth) {
+		cell.x = -realMapWidth + r;
 		if (fromBoost) cell.boostUnitX *= -1;
-	} else if (settings.worldMapW < cell.x + r) {
-		cell.x = settings.worldMapW - r;
+	} else if (realMapWidth < cell.x + r) {
+		cell.x = realMapWidth - r;
 		if (fromBoost) cell.boostUnitX *= -1;
 	}
-	if (cell.y - r < -settings.worldMapW) {
-		cell.y = -settings.worldMapW + r;
+	if (cell.y - r < -realMapWidth) {
+		cell.y = -realMapWidth + r;
 		if (fromBoost) cell.boostUnitY *= -1;
-	} else if (settings.worldMapW < cell.y + r) {
-		cell.y = settings.worldMapW - r;
+	} else if (realMapWidth < cell.y + r) {
+		cell.y = realMapWidth - r;
 		if (fromBoost) cell.boostUnitY *= -1;
 	}
 };
@@ -191,6 +193,7 @@ const add = cellSkeleton => {
 		moveU8: EMPTY_BUFFER_U8, moveDat: EMPTY_BUFFER_DAT,
 		firstU8: EMPTY_BUFFER_U8, firstDat: EMPTY_BUFFER_DAT,
 		mergeable: false, fed: 0,
+		bgXmin: 0, bgXmax: 0, bgYmin: 0, bgYmax: 0,
 		...cellSkeleton,
 	};
 	encode(cell);
@@ -244,14 +247,14 @@ const leftCollidesRight = (leftCell, rightCell) => {
 };
 
 const safeSpawnPos = (radius) => {
-	for (let i = 0; i < settings.worldSafeSpawnTries; ++i) {
-		const x = (Math.random() * 2 - 1) * (settings.worldMapW - radius);
-		const y = (Math.random() * 2 - 1) * (settings.worldMapH - radius);
+	for (let i = 0; i < 64; ++i) {
+		const x = (Math.random() * 2 - 1) * (realMapWidth - radius);
+		const y = (Math.random() * 2 - 1) * (realMapWidth - radius);
 
-		const xmin = ((x + settings.worldMapW - radius) / BITGRID_TILE_SIZE) & 0x1f;
-		const xmax = ((x + settings.worldMapW + radius) / BITGRID_TILE_SIZE) & 0x1f;
-		const ymin = ((y + settings.worldMapH - radius) / BITGRID_TILE_SIZE) & 0x1f;
-		const ymax = ((y + settings.worldMapH + radius) / BITGRID_TILE_SIZE) & 0x1f;
+		const xmin = ((x + realMapWidth - radius) / BITGRID_TILE_SIZE) & 0x1f;
+		const xmax = ((x + realMapWidth + radius) / BITGRID_TILE_SIZE) & 0x1f;
+		const ymin = ((y + realMapWidth - radius) / BITGRID_TILE_SIZE) & 0x1f;
+		const ymax = ((y + realMapWidth + radius) / BITGRID_TILE_SIZE) & 0x1f;
 		if (!bitgridSearch(xmin, xmax, ymin, ymax, cell => {
 			if (cell.type === CELL_TYPE_PELLET) return;
 			if (x - radius <= cell.x + cell.r && cell.x - cell.r <= x + radius
@@ -262,8 +265,8 @@ const safeSpawnPos = (radius) => {
 		}
 	}
 
-	const x = (Math.random() * 2 - 1) * (settings.worldMapW - radius);
-	const y = (Math.random() * 2 - 1) * (settings.worldMapH - radius);
+	const x = (Math.random() * 2 - 1) * (realMapWidth - radius);
+	const y = (Math.random() * 2 - 1) * (realMapWidth - radius);
 	return [x, y];
 };
 
@@ -335,13 +338,53 @@ const worldTick = () => {
 
 	if (nextCellId >= 4e9) nextCellId = 1;
 
+	if (settings.worldMapW !== realMapWidth) {
+		// console-only: resize map, and update every cell's place in the bitgrid
+		const cells = [];
+		bitgridSearch(0, 31, 0, 31, cell => {
+			cells.push(cell);
+		});
+
+		for (const cell of cells) bitgridRemove(cell);
+		console.log(Array.from(bitgridTiles));
+		realMapWidth = settings.worldMapW;
+		BITGRID_TILE_SIZE = Math.max(2500, (realMapWidth * 2 + 3000) / 32);
+		for (const cell of cells) {
+			if (cell.type !== CELL_TYPE_PELLET) {
+				// delete all pellets, clamp all others to the new map bounds
+				bounce(cell);
+				bitgridAdd(cell); // do NOT use bitgridUpdate
+				cell.moved = now;
+				encode(cell);
+			}
+		}
+		pellets = 0;
+
+		// immediately send update to all clients
+		writerU8[0] = 0x40; // border update packet
+		writerDat.setFloat64(1, -realMapWidth, true);
+		writerDat.setFloat64(9, -realMapWidth, true);
+		writerDat.setFloat64(17, realMapWidth, true);
+		writerDat.setFloat64(25, realMapWidth, true);
+		for (const player of players) {
+			if (player.ws) void player.ws.send(writerU8.subarray(0, 33), true);
+		}
+	}
+
 	for (; pellets < settings.pelletCount; ++pellets) {
-		const [x, y] = safeSpawnPos(settings.pelletMinSize); // TODO, this should probably not be safeSpawnPos
+		let x, y;
+		if (pellets + 500 < settings.pelletCount) {
+			// if adding tons more pellets, there can be very long lag spikes if using safeSpawnPos
+			x = (Math.random() * 2 - 1) * realMapWidth;
+			y = (Math.random() * 2 - 1) * realMapWidth;
+		} else {
+			([x, y] = safeSpawnPos(settings.pelletMinSize));
+		}
 		add({ type: CELL_TYPE_PELLET, x, y, r: settings.pelletMinSize, rgb: randomColors[~~(Math.random() * 1536)] });
 	}
 
 	if (pellets > settings.pelletCount) {
-		// only happens very rarely
+		// console-only: evenly remove pellets
 		const fraction = pellets / settings.pelletCount;
 		let i = 0;
 		const removalQueue = [];
@@ -355,6 +398,18 @@ const worldTick = () => {
 	for (; viruses < settings.virusMinCount; ++viruses) {
 		const [x, y] = safeSpawnPos(settings.virusSize);
 		add({ type: CELL_TYPE_VIRUS, x, y, r: settings.virusSize, rgb: 0x33ff33 });
+	}
+
+	if (viruses > settings.virusMaxCount) {
+		// console-only: evenly remove viruses
+		const fraction = viruses / settings.virusMaxCount;
+		let i = 0;
+		const removalQueue = [];
+		bitgridSearch(0, 31, 0, 31, cell => {
+			if (cell.type === CELL_TYPE_VIRUS && ++i % fraction >= 1) removalQueue.push(cell);
+		});
+		for (const virus of removalQueue) bitgridRemove(virus);
+		viruses -= removalQueue.length;
 	}
 
 	for (let i = 0, l = boostingCells.length; i < l; ++i) {
@@ -745,8 +800,8 @@ const worldTick = () => {
 				const distance = Math.min(d, settings.playerRoamSpeed);
 				if (distance >= 1) {
 					player.camera = {
-						x: Math.min(Math.max(player.camera.x + dx / d * distance, -settings.worldMapW), settings.worldMapW),
-						y: Math.min(Math.max(player.camera.y + dy / d * distance, -settings.worldMapW), settings.worldMapW),
+						x: Math.min(Math.max(player.camera.x + dx / d * distance, -realMapWidth), realMapWidth),
+						y: Math.min(Math.max(player.camera.y + dy / d * distance, -realMapWidth), realMapWidth),
 						scale: settings.playerRoamViewScale,
 					};
 				}
@@ -921,10 +976,10 @@ const worldTick = () => {
 		const cameraXmax = player.camera.x + cameraWidth;
 		const cameraYmin = player.camera.y - cameraHeight;
 		const cameraYmax = player.camera.y + cameraHeight;
-		const xmin = ~~(Math.max(cameraXmin + settings.worldMapW, 0) / BITGRID_TILE_SIZE);
-		const xmax = ~~(Math.min(cameraXmax + settings.worldMapW, settings.worldMapW * 2) / BITGRID_TILE_SIZE);
-		const ymin = ~~(Math.max(cameraYmin + settings.worldMapH, 0) / BITGRID_TILE_SIZE);
-		const ymax = ~~(Math.min(cameraYmax + settings.worldMapH, settings.worldMapH * 2) / BITGRID_TILE_SIZE);
+		const xmin = ~~(Math.max(cameraXmin + realMapWidth, 0) / BITGRID_TILE_SIZE);
+		const xmax = ~~(Math.min(cameraXmax + realMapWidth, realMapWidth * 2) / BITGRID_TILE_SIZE);
+		const ymin = ~~(Math.max(cameraYmin + realMapWidth, 0) / BITGRID_TILE_SIZE);
+		const ymax = ~~(Math.min(cameraYmax + realMapWidth, realMapWidth * 2) / BITGRID_TILE_SIZE);
 		bitgridSearch(xmin, xmax, ymin, ymax, cell => {
 			if (cameraXmin <= cell.x + cell.r && cell.x - cell.r <= cameraXmax
 				&& cameraYmin <= cell.y + cell.r && cell.y - cell.r <= cameraYmax) {
@@ -1176,10 +1231,10 @@ for (let i = 0, o = SIG_VERSION_STRING_U8.length; i < 256; ++i, ++o) SIG_HANDSHA
 
 const BORDER_UPDATE_PACKET_DAT = new DataView(new ArrayBuffer(33));
 BORDER_UPDATE_PACKET_DAT.setUint8(0, 0x40);
-BORDER_UPDATE_PACKET_DAT.setFloat64(1, -settings.worldMapW, true);
-BORDER_UPDATE_PACKET_DAT.setFloat64(9, -settings.worldMapH, true);
-BORDER_UPDATE_PACKET_DAT.setFloat64(17, settings.worldMapW, true);
-BORDER_UPDATE_PACKET_DAT.setFloat64(25, settings.worldMapH, true);
+BORDER_UPDATE_PACKET_DAT.setFloat64(1, -realMapWidth, true);
+BORDER_UPDATE_PACKET_DAT.setFloat64(9, -realMapWidth, true);
+BORDER_UPDATE_PACKET_DAT.setFloat64(17, realMapWidth, true);
+BORDER_UPDATE_PACKET_DAT.setFloat64(25, realMapWidth, true);
 const BORDER_UPDATE_PACKET_U8 = new Uint8Array(BORDER_UPDATE_PACKET_DAT.buffer);
 
 const SERVER_NAME_U8 = encodeUtf8AsU8('Server');
@@ -1636,4 +1691,5 @@ console.log(`server started in ${performance.now().toFixed(1)}ms`);
 
 process.on('uncaughtException', (err, origin) => {
 	log.write(`${new Date().toISOString()} | uncaughtException:\nerr: ${err}\norigin: ${origin}\n`);
+	console.error(err);
 });
