@@ -8,7 +8,7 @@
     "serverPassword": "",
     "worldMapW": 17071,
     "worldPlayerDisposeDelay": 1500,
-    "worldPlayerBotsPerWorld": 40,
+    "worldPlayerBotsPerWorld": 30,
     "worldPlayerBotIgnorePlayers": false,
     "worldPlayerBotNames": [
         "{*}Valeriy",
@@ -55,12 +55,12 @@
         "1%Fungus",
         "1%George"
     ],
-    "worldMinionsPerPlayer": 30,
+    "worldMinionsPerPlayer": 40,
     "worldMaxMinions": 240,
     "minionName": "\t",
     "minionSpawnSize": 100,
     "pelletMinSize": 20,
-    "pelletCount": 5500,
+    "pelletCount": 21000,
     "virusMinCount": 20,
     "virusMaxCount": 30,
     "virusSize": 100,

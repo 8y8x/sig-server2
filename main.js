@@ -146,6 +146,7 @@ const boostingCells = [];
 const playerCells = [];
 const players = new Map();
 const playerBotAi = new WeakMap();
+const savestates = [];
 let connections = 0;
 let nextCellId = 1;
 let now = 0; // current tick
@@ -167,7 +168,7 @@ const addPlayer = playerSkeleton => {
 	let id;
 	const maxId = players.size <= 500 ? 1000 : settings.listenerMaxConnections + settings.worldMaxMinions * 2;
 	do {
-		id = ~~(Math.random() * maxId);
+		id = 'p' + String(~~(Math.random() * maxId)).padStart(3, '0');
 	} while (players.has(id));
 
 	const player = {
@@ -176,7 +177,7 @@ const addPlayer = playerSkeleton => {
 		chatAt: now,
 		clanU8: EMPTY_STRING_U8,
 		disconnectedAt: 0,
-		id: 'p' + String(id).padStart(3, '0'),
+		id,
 		lastW: 0,
 		minionCommander: undefined,
 		mouseX: 0,
@@ -186,6 +187,8 @@ const addPlayer = playerSkeleton => {
 		rgb: 0x7f7f7f,
 		q: false,
 		showClanmates: false,
+		sigmallyEmail: '',
+		sigmallyToken: '',
 		skinU8: EMPTY_STRING_U8,
 		spawn: undefined,
 		splits: 0,
@@ -197,7 +200,7 @@ const addPlayer = playerSkeleton => {
 		ws: undefined,
 		...playerSkeleton,
 	};
-	players.set(player.id, player);
+	players.set(id, player);
 	return player;
 };
 
@@ -225,7 +228,7 @@ const add = cellSkeleton => {
 		id: nextCellId++,
 		x: 0, y: 0, r: 100,
 		rgb: 0x7f7f7f,
-		born: now, moved: now, dead: false, deadTo: 0,
+		born: now, moved: now, updated: now, dead: false, deadTo: 0,
 		owner: PLAYER_OWNER_SERVER,
 		boostUnitX: 0, boostUnitY: 0, boostMagnitude: 0,
 		moveU8: EMPTY_BUFFER_U8, moveDat: EMPTY_BUFFER_DAT,
@@ -348,6 +351,14 @@ const encode = cell => {
 		firstDat.setInt16(6, cell.y, true);
 		firstDat.setUint16(8, cell.r, true);
 	}
+};
+
+const compareU8 = (a, b) => {
+	if (a.length !== b.length) return false;
+	for (let o = 0; o < a.length; ++o) {
+		if (a[o] !== b[o]) return false;
+	}
+	return true;
 };
 
 // +-------------------------------------------------------------------------------------------------------------------+
@@ -485,7 +496,7 @@ const worldTick = () => {
 	for (let i = 0, l = playerCells.length; i < l; ++i) {
 		const cell = playerCells[i];
 		const { owner } = cell;
-		if (!owner.disconnectedAt) {
+		if (!owner.disconnectedAt && owner !== PLAYER_OWNER_SERVER) {
 			let dx = owner.mouseX - cell.x;
 			let dy = owner.mouseY - cell.y;
 			let d = Math.hypot(dx, dy);
@@ -1046,7 +1057,7 @@ const worldTick = () => {
 		// the new Set.prototype.difference and .intersection functions are only faster if the two sets are very
 		// disjoint, but usually they aren't (a player can't move that far between ticks)
 		// also, they were only added in node.js 22, which is quite recent, so better to stick with the old method
-		const newOwned = [];
+		const newOwned = new Set();
 		let eatL = 0, addL = 0, updL = 0, delL = 0;
 		const eat = worldPacketEatArray;
 		const add = worldPacketAddArray;
@@ -1054,9 +1065,10 @@ const worldTick = () => {
 		const del = worldPacketDelArray;
 		for (const cell of visibleCells) {
 			if (oldVisibleCells.has(cell)) {
-				if (cell.moved === now) upd[updL++] = cell.moveU8;
+				if (cell.updated === now) upd[updL++] = cell.firstU8;
+				else if (cell.moved === now) upd[updL++] = cell.moveU8;
 			} else {
-				if (cell.owner === player) newOwned.push(cell.id);
+				if (cell.owner === player) newOwned.add(cell);
 				add[addL++] = cell.firstU8;
 			}
 		}
@@ -1071,12 +1083,14 @@ const worldTick = () => {
 		if (updL > maxUpdL) maxUpdL = updL;
 		if (delL > maxDelL) maxDelL = delL;
 
-		if (newOwned.length) {
+		if (newOwned.size) {
 			writerU8[0] = 0x20;
-			for (let i = 0; i < newOwned.length; ++i) {
-				writerDat.setUint32(1, newOwned[i], true);
-				if (player.ws.send(writerU8.subarray(0, 5), true) !== 1) {
-					continue con2PlayerLoop;
+			for (const cell of player.owned) {
+				if (newOwned.has(cell)) { // make sure new owned cells are transmitted in order
+					writerDat.setUint32(1, cell.id, true);
+					if (player.ws.send(writerU8.subarray(0, 5), true) !== 1) {
+						continue con2PlayerLoop;
+					}
 				}
 			}
 		}
@@ -1364,6 +1378,8 @@ uws.App()
 					sub: !!body.sub,
 				};
 				player.clan = encodeUtf8AsU8(body.clan ? body.clan.substring(0, 32) : '');
+				player.token = body.token || ''; // used for detecting if another connection is the same player
+				player.email = body.email || ''; // ^^^
 			} else if (opcode === 0x10) {
 				if (dat.byteLength === 13) {
 					player.mouseX = dat.getInt32(o, true);
@@ -1780,7 +1796,182 @@ const command = (line, superadmin) => {
 					}
 					process.exit(0);
 				}, 5000);
-				return `The server will exit once all players leave`;
+				return `The server will exit once all players leave\n`;
+			} else if (cmd === 'savestate-add') {
+				const cells = new Map();
+				bitgridSearch(0, 31, 0, 31, cell => {
+					cells.set(cell.id, { ...cell });
+				});
+
+				const sPlayers = new Set(players.values());
+				const boostingCellIds = boostingCells.map(x => x.id);
+				const playerCellIds = playerCells.map(x => x.id);
+
+				savestates.push({
+					cells, sPlayers, boostingCellIds, playerCellIds, worldMapW: settings.worldMapW,
+					time: now,
+				});
+				if (savestates.length > 10) {
+					savestates.shift();
+					return `Savestate ${savestates.length} pushed, oldest one was removed\n`;
+				} else {
+					return `Savestate ${savestates.length} pushed\n`;
+				}
+			} else if (cmd === 'savestate-restore') {
+				if (!savestates.length) return `No savestates\n`;
+				const { cells, sPlayers: sPlayersCopy, boostingCellIds, playerCellIds, worldMapW, time } = savestates[savestates.length - 1];
+				settings.worldMapW = worldMapW;
+
+				const delta = now - time;
+
+				// first, match players with the ones that currently exist
+				const playersS2C = new Map();
+				const sPlayers = new Set(sPlayersCopy);
+				const cPlayers = new Set(players.values());
+				for (const player of sPlayers) {
+					if (cPlayers.has(player) && !player.disconnectedAt) {
+						playersS2C.set(player, player);
+						cPlayers.delete(player);
+						sPlayers.delete(player);
+					}
+				}
+
+				// resolve real players that may have reconnected
+				for (const sPlayer of sPlayers) {
+					if (sPlayer.bot || sPlayer.minionCommander) {
+						for (const cPlayer of cPlayers) {
+							if (cPlayer !== sPlayer && cPlayer.bot === sPlayer.bot
+								&& !!cPlayer.minionCommander === !!sPlayer.minionCommander) {
+								playersS2C.set(sPlayer, cPlayer);
+								cPlayers.delete(cPlayer);
+								sPlayers.delete(sPlayer);
+								break;
+							}
+						}
+						continue;
+					}
+
+					// players that had disconnected when the savestate was made shouldn't be included
+					if (sPlayer.disconnectedAt < time) continue;
+
+					let bestMatch, bestMatchScore = 0;
+					for (const cPlayer of cPlayers) {
+						if (cPlayer.bot || cPlayer.minionCommander) continue;
+						let score = 0;
+						if (cPlayer.sigmallyToken === sPlayer.sigmallyToken
+							&& cPlayer.sigmallyEmail === sPlayer.sigmallyEmail) score += 4;
+						if (compareU8(cPlayer.nameU8, sPlayer.nameU8)) score += 2;
+						if (compareU8(cPlayer.clanU8, sPlayer.clanU8)) score += 1;
+						if (cPlayer.disconnectedAt) score -= 6;
+
+						if (score > bestMatchScore) [bestMatch, bestMatchScore] = [cPlayer, score];
+					}
+
+					if (bestMatch) {
+						playersS2C.set(sPlayer, bestMatch);
+						cPlayers.delete(bestMatch);
+						sPlayers.delete(sPlayer);
+					}
+				}
+
+				// if a player cell's owner is not in playersS2C, then no suitable replacement player was found
+				// replace it with a gray dead cell owned by the server
+
+				// then apply player descriptions (nameU8, skinU8, clanU8, rgb, ...)
+				for (const [sPlayer, cPlayer] of playersS2C) {
+					cPlayer.nameU8 = sPlayer.nameU8;
+					cPlayer.skinU8 = sPlayer.skinU8;
+					cPlayer.clanU8 = sPlayer.clanU8;
+					cPlayer.rgb = sPlayer.rgb;
+					cPlayer.sub = sPlayer.sub;
+				}
+
+				// then remap all cells
+				const sCells = new Map(cells);
+				const cCells = new Map();
+				bitgridSearch(0, 31, 0, 31, cell => {
+					cCells.set(cell.id, cell);
+				});
+
+				const cellsS2C = new Map();
+				for (const sCell of sCells.values()) {
+					const cCell = cCells.get(sCell.id);
+					if (!cCell) continue;
+					cellsS2C.set(sCell, cCell);
+					sCells.delete(sCell.id);
+					cCells.delete(sCell.id);
+
+					cCell.born = sCell.born + delta;
+					cCell.boostUnitX = sCell.boostUnitX;
+					cCell.boostUnitY = sCell.boostUnitY;
+					cCell.boostMagnitude = sCell.boostMagnitude;
+					cCell.mergeable = sCell.mergeable; cCell.fed = sCell.fed;
+					cCell.dead = sCell.dead; cCell.deadTo = sCell.deadTo;
+					cCell.updated = now;
+
+					if (sCell.owner !== PLAYER_OWNER_SERVER) {
+						const cOwner = playersS2C.get(sCell.owner);
+						if (cOwner) cCell.owner = cOwner;
+						else {
+							cCell.owner = PLAYER_OWNER_SERVER;
+							cCell.rgb = 0x000080;
+						}
+					}
+
+					if (cCell.x !== sCell.x || cCell.y !== sCell.y || cCell.r !== sCell.r) {
+						cCell.x = sCell.x; cCell.y = sCell.y; cCell.r = sCell.r;
+						cCell.moved = now;
+						bitgridUpdate(cCell);
+					}
+
+					encode(cCell);
+				}
+
+				// remove extra cells
+				for (const cCell of cCells.values()) bitgridRemove(cCell);
+
+				// resolve cells that don't exist anymore
+				for (const sCell of sCells.values()) {
+					const cCell = add(sCell);
+					cCell.born = sCell.born + delta;
+					if (sCell.owner !== PLAYER_OWNER_SERVER) {
+						const cOwner = playersS2C.get(sCell.owner);
+						if (cOwner) cCell.owner = cOwner;
+						else {
+							cCell.owner = PLAYER_OWNER_SERVER;
+							cCell.rgb = 0x000080;
+							cCell.updated = now;
+						}
+					}
+					bitgridAdd(cCell);
+					encode(cCell);
+					cellsS2C.set(sCell, cCell);
+				}
+
+				const cCellById = new Map();
+				for (const [sCell, cCell] of cellsS2C) cCellById.set(sCell.id, cCell);
+
+				for (let i = 0; i < boostingCellIds.length; ++i) boostingCells[i] = cCellById.get(boostingCellIds[i]);
+				boostingCells.length = boostingCellIds.length;
+
+				for (const player of players.values()) player.owned.clear();
+				for (let i = 0; i < playerCellIds.length; ++i) {
+					const cCell = cCellById.get(playerCellIds[i]);
+					playerCells[i] = cCell;
+					cCell.owner.owned.add(cCell); // this will be ordered from oldest to newest!
+				}
+				playerCells.length = playerCellIds.length;
+
+				for (const player of players.values()) {
+					if (player.owned.size) player.state = PLAYER_STATE_PLAYING;
+					else if (player.state === PLAYER_STATE_PLAYING) player.state = PLAYER_STATE_IDLE;
+				}
+
+				return `Restored savestate\n`;
+			} else if (cmd === 'savestate-delete') {
+				if (!savestates.length) return `No savestates\n`;
+				savestates.pop();
+				return `Savestate ${savestates.length + 1} popped\n`;
 			} else if (cmd === 'say') {
 				// if using the server flag, then sigfixes will duplicate messages between tabs, so
 				// don't send messages to tabs on the same IP address
