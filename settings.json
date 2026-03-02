@@ -2,6 +2,7 @@
     "listenerMaxConnections": 9999,
     "listenerMaxClientDormancy": 60000,
     "listeningPort": 80,
+    "listenerSecure": false,
     "consolePort": 9119,
     "serverName": "8y8x/sig-server2",
     "serverGamemode": "FFA",

@@ -3,3 +3,5 @@ node_modules
 Heap**
 log**
 console-keys
+fullchain.pem
+privkey.pem

@@ -1283,7 +1283,11 @@ const messagePacketU8 = (flags, color, nameU8, messageU8) => {
 let cliChatMuted = false;
 
 const CONSOLE_HTML = fs.readFileSync('./console.html');
-uws.App()
+uws[settings.listenerSecure ? 'SSLApp' : 'App']({
+	key_file_name: 'privkey.pem',
+	cert_file_name: 'fullchain.pem',
+	passphrase: '',
+})
 	.get('/console', (res, req) => res.end(CONSOLE_HTML))
 	.ws('/*', {
 		idleTimeout: 60,
@@ -1488,7 +1492,10 @@ try {
 	if (consoleKeys.size) console.log(`Loaded ${consoleKeys.size} console keys`);
 } catch (_) { }
 
-uws.App()
+uws[settings.listenerSecure ? 'SSLApp' : 'App']({
+	key_file_name: 'privkey.pem',
+	cert_file_name: 'fullchain.pem',
+})
 	.ws('/*', {
 		idleTimeout: 60,
 		maxBackpressure: 64 * 1024,
