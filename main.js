@@ -1250,7 +1250,7 @@ const worldTick = () => {
 	// #4 update gamemode-specific
 
 	const elapsed = performance.now() - start;
-	metricsMeasurements[now % 100] = { points: framePoints, time: elapsed };
+	metricsMeasurements[now % 25] = { points: framePoints, time: elapsed };
 	++now;
 	setTimeout(worldTick, Math.max(40 - elapsed, 0));
 };
@@ -2040,7 +2040,7 @@ const command = (line, superadmin) => {
 				if (args[0] === 'minionSpawnSize' && !(40 <= value && value <= 2500)) return `minionSpawnSize must be between 40 and 2500\n`;
 				if (args[0] === 'pelletMinSize' && !(1 <= value && value < 40)) return `pelletMinSize must be between 1 and 39\n`;
 				if (args[0] === 'pelletCount' && !(0 <= value && value <= 100000)) return `pelletCount must be between 0 and 100000\n`;
-				if (args[0] === 'virusMinCount' && !(0 <= value && value <= setting.virusMaxCount)) return `virusMinCount must be between 0 and virusMaxCount\n`;
+				if (args[0] === 'virusMinCount' && !(0 <= value && value <= settings.virusMaxCount)) return `virusMinCount must be between 0 and virusMaxCount\n`;
 				if (args[0] === 'virusMaxCount' && !(settings.virusMinCount <= value && value <= 10000)) return `virusMaxCount must be between virusMinCount and 10000\n`;
 				if (args[0] === 'virusSize' && !(1 <= value && value <= 2500)) return `virusSize must be between 1 and 2500\n`;
 				if (args[0] === 'virusFeedTimes' && !(1 <= value && value <= 100)) return `virusFeedTimes must be between 1 and 100\n`;
