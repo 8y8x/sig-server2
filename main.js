@@ -1736,7 +1736,7 @@ const command = (line, superadmin) => {
 						j = 0;
 						for (let i = 0, l = boostingCells.length; i < l; ++i) {
 							boostingCells[j] = boostingCells[i];
-							if (boostingCells[i].owner !== player || !playerCells[i].deadTo) ++j;
+							if (boostingCells[i].owner !== player || !boostingCells[i].deadTo) ++j;
 						}
 						boostingCells.length = j;
 					}
