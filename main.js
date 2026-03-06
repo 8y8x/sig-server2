@@ -589,7 +589,7 @@ const worldTick = () => {
 		const dx = b.x - a.x;
 		const dy = b.y - a.y;
 		const d = Math.hypot(dx, dy);
-		if (d > a.r - b.r / settings.worldOverlapEatDiv) continue;
+		if (d > a.r - b.r * WORLD_EAT_OVERLAP_MULT) continue;
 
 		a.r = Math.sqrt(a.r * a.r + b.r * b.r);
 		a.moved = now;
