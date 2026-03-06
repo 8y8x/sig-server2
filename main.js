@@ -1511,14 +1511,20 @@ uws[settings.listenerSecure ? 'SSLApp' : 'App']({
 				req.getHeader('sec-websocket-protocol'),
 				req.getHeader('sec-websocket-extensions'),
 				context);
+
+			log.write(`${new Date().toISOString()} | ${consoleKeys.get(auth)} connected\n`);
 		},
 		message: (client, buf) => {
-			if (!consoleKeys.has(client.getUserData().auth)) {
+			const { auth } = client.getUserData();
+			if (!consoleKeys.has(auth)) {
 				client.send(textEncoder.encode('You are no longer authenticated\n'), true);
 				return client.end();
 			}
 
-			const res = textEncoder.encode(command(textDecoder.decode(buf), false));
+			const content = textDecoder.decode(buf);
+			log.write(`${new Date().toISOString()} | ${consoleKeys.get(auth)} ran command: ${content}\n`);
+
+			const res = textEncoder.encode(command(content, false));
 			void client.send(res, true);
 		},
 	})
@@ -1552,6 +1558,7 @@ const command = (line, superadmin) => {
 					'merge <id> - combines all of a player\'s cells',
 					'merge-all - every player has their cells combined',
 					'players - shows all active players and their ids',
+					'restore - resets all settings to their defaults, from settings.json',
 					'safeexit - stops the server once all players leave (superadmin only)',
 					'savestate-add - creates a snapshot of the entire game and saves it for later',
 					'savestate-restore - loads the most recent savestate',
@@ -1790,9 +1797,9 @@ const command = (line, superadmin) => {
 					lines.push(`${place++}. ${player.id} : ${textDecoder.decode(player.nameU8)} (${stringifiedScore})`);
 				}
 
-				if (bots.length > 3) bots.length = 3;
+				if (bots.length > 5) bots.length = 5;
 				if (bots.length) {
-					lines.push(``, `Top 3 bots: ${bots.map(([player,score]) => {
+					lines.push(``, `Top 5 bots: ${bots.map(([player,score]) => {
 						const stringifiedScore = score >= 1000 ? (score / 1000).toFixed(1) + 'k' : ~~score;
 						return `${player.id} ${textDecoder.decode(player.nameU8)} (${stringifiedScore})`;
 					}).join(' / ')}`);
@@ -1801,6 +1808,16 @@ const command = (line, superadmin) => {
 				lines.push(``, `${spectating} spectating, ${roaming} roaming, ${idle} idle`);
 
 				return lines.join('\n') + '\n';
+			} else if (cmd === 'reload') {
+				let newSettings;
+				try {
+					newSettings = JSON.parse(fs.readFileSync('settings.json', 'utf-8'));
+				} catch (_) {
+					return 'Failed to parse settings.json\n';
+				}
+
+				Object.assign(settings, newSettings);
+				return 'Settings have been restored from settings.json\n';
 			} else if (cmd === 'safeexit') {
 				if (!superadmin) return 'Only the superadmin can run this\n';
 				setInterval(() => {
