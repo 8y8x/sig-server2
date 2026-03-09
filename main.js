@@ -5,7 +5,81 @@ const fs = require('node:fs');
 const readline = require('node:readline');
 const uws = require('uWebSockets.js');
 
-const settings = require('./settings.json');
+const settings = {
+	"listenerMaxConnections": 9999,
+	"listenerMaxClientDormancy": 60000,
+	"listeningPort": 80,
+	"listenerSecure": false,
+	"consolePort": 9119,
+	"serverName": "8y8x/sig-server2",
+	"serverGamemode": "FFA",
+	"serverPassword": "",
+	"worldMapW": 17071,
+	"worldPlayerDisposeDelay": 1500,
+	"worldPlayerBotsPerWorld": 30,
+	"worldPlayerBotIgnorePlayers": false,
+	"worldPlayerBotNames": [
+		"Valeriy", "Mtch", "Messi", "Michael", "LadyInRed", "Slava", "Migel", "Mik", "Moon", "Ignasio", "Cos", "Bred",
+		"Krishtianu", "Varpat", "Monica", "Loli", "Corat", "Sun", "ChaCha", "Voron", "Baby", "Mimi",
+	],
+	"worldPlayerBotSkins": [
+		"1%Alexander", "1%Celia", "1%Chip", "1%Dale", "1%Hardscrabble", "1%Harley", "1%Rocky", "1%Lenny", "1%Chet",
+		"1%Proctor", "1%Roz", "1%Art", "1%Bile", "1%Boo", "1%Brandywine", "1%Carlton", "1%Derek", "1%Fungus", "1%George"
+	],
+	"worldMinionsPerPlayer": 40,
+	"worldMaxMinions": 240,
+	"minionName": "\t",
+	"minionSpawnSize": 100,
+	"pelletMinSize": 20,
+	"pelletCount": 21000,
+	"virusMinCount": 20,
+	"virusMaxCount": 30,
+	"virusSize": 100,
+	"virusFeedTimes": 5,
+	"virusSplitBoost": 880,
+	"ejectedSize": 40,
+	"ejectingLoss": 40,
+	"ejectDispersion": 0.3,
+	"ejectedCellBoost": 880,
+	"playerRoamSpeed": 80,
+	"playerRoamViewScale": 0.15,
+	"playerViewScaleMult": 2,
+	"playerMinSize": 64,
+	"playerSpawnSize": 166,
+	"playerMaxSize": 2500,
+	"playerMinSplitSize": 128,
+	"playerMinEjectSize": 100,
+	"playerEjectDelay": 2,
+	"playerMaxCells": 16,
+	"playerMoveMult": 2.5,
+	"playerSplitDistance": 60,
+	"playerSplitBoost": 780,
+	"playerNoCollideDelay": 13,
+	"playerMergeTime": 30,
+	"playerMergeTimeIncrease": 0.02,
+	"playerDecayMult": 0.009,
+	"leaderboardMaxLength": 10,
+	"leaderboardShowMass": false,
+	"leaderboardShowBots": true,
+	"leaderboardTeamBanner": false,
+	"leaderboardUpdateDelay": 4
+};
+{
+	let settingsJson;
+	try {
+		settingsJson = fs.readFileSync('settings.json', 'utf-8');
+	} catch (_) {
+		fs.writeFileSync('settings.json', JSON.stringify(settings, undefined, 4));
+	}
+
+	if (settingsJson) {
+		try {
+			Object.assign(settings, JSON.parse(settingsJson));
+		} catch (_) {
+			console.log('settings.json is invalid, please check your commas; falling back to default settings');
+		}
+	}
+}
 
 const textDecoder = new TextDecoder();
 const textEncoder = new TextEncoder();
@@ -28,7 +102,7 @@ const encodeUtf8AsU8 = s => {
 // +-------------------------------------------------------------------------------------------------------------------+
 
 // undefined behaviour occurs if a cell ever exists beyond the bitgrid, just keep it in mind
-// (the width and height) get all messed up
+// (the width and height get all messed up)
 let realMapWidth = settings.worldMapW;
 let BITGRID_TILE_SIZE = Math.max(2500, (realMapWidth * 2 + 3000) / 32);
 const bitgridTiles = [];
@@ -111,6 +185,7 @@ const PLAYER_OWNER_SERVER = {
 	camera: { x: 0, y: 0, scale: 1 },
 	clanU8: EMPTY_STRING_U8,
 	disconnectedAt: 0,
+	id: 'server',
 	lastW: 0,
 	minionCommander: undefined,
 	mouseX: 0,
@@ -1558,7 +1633,7 @@ const command = (line, superadmin) => {
 					'merge <id> - combines all of a player\'s cells',
 					'merge-all - every player has their cells combined',
 					'players - shows all active players and their ids',
-					'restore - resets all settings to their defaults, from settings.json',
+					'reload - resets all settings to their defaults, from settings.json',
 					'safeexit - stops the server once all players leave (superadmin only)',
 					'savestate-add - creates a snapshot of the entire game and saves it for later',
 					'savestate-restore - loads the most recent savestate',
@@ -1568,6 +1643,7 @@ const command = (line, superadmin) => {
 					'setting <key> - shows the value of a setting',
 					'setting <key> <value> - changes a setting to another value',
 					'stats - shows server load, uptime, player count, and cell count',
+					'uncorrupt - performs an in-depth search for any corrupted cells or state, and writes a report',
 				].join('\n') + '\n';
 			} else if (cmd === 'key-add') {
 				if (!superadmin) return 'Only the superadmin can run this\n';
@@ -1906,7 +1982,7 @@ const command = (line, superadmin) => {
 				}
 
 				// if a player cell's owner is not in playersS2C, then no suitable replacement player was found
-				// replace it with a gray dead cell owned by the server
+				// replace it with a red dead cell owned by the server
 
 				// then apply player descriptions (nameU8, skinU8, clanU8, rgb, ...)
 				for (const [sPlayer, cPlayer] of playersS2C) {
@@ -2140,6 +2216,132 @@ const command = (line, superadmin) => {
 				output.push(`${playing} playing - ${spectating} spectating - ${idle} idle - ${minions} minions - ${bots} bots\n`);
 
 				return output.join('');
+			} else if (cmd === 'uncorrupt') {
+				const seen = new Set();
+
+				const alreadyDead = new Set();
+				const expiredOwner = new Set();
+				const forgottenBoostingCell = new Set();
+				const forgottenPlayerCell = new Set();
+				const bitgridBoundsExceeded = new Set();
+				const invalidBitgridPlacement = new Set();
+				const unrecognizedChild = new Set();
+				const unrecognizedParent = new Set();
+				const duplicateBitgridResult = new Set();
+				let localPellets = 0, localViruses = 0;
+				bitgridSearch(0, 31, 0, 31, cell => {
+					if (cell.dead || cell.deadTo) alreadyDead.add(cell);
+
+					if (cell.owner !== PLAYER_OWNER_SERVER && cell.owner.disconnectedAt
+						&& now - cell.owner.disconnectedAt > settings.worldPlayerDisposeDelay) {
+						expiredOwner.add(cell);
+					}
+
+					if (cell.type === CELL_TYPE_PLAYER && !playerCells.includes(cell)) {
+						forgottenPlayerCell.add(cell);
+					}
+
+					if (cell.type !== CELL_TYPE_PELLET && (cell.boostMagnitude >= 1) !== boostingCells.includes(cell)) {
+						forgottenBoostingCell.add(cell);
+					}
+
+					if (cell.owner !== PLAYER_OWNER_SERVER && !cell.owner.owned.has(cell)) {
+						unrecognizedChild.add(cell);
+					}
+
+					if (cell.type === CELL_TYPE_PELLET) ++localPellets;
+					else if (cell.type === CELL_TYPE_VIRUS) ++localViruses;
+
+					if (seen.has(cell)) duplicateBitgridResult.add(cell);
+					else seen.add(cell);
+
+					let xmin = ((cell.x + realMapWidth - cell.r) / BITGRID_TILE_SIZE);
+					let xmax = ((cell.x + realMapWidth + cell.r) / BITGRID_TILE_SIZE);
+					let ymin = ((cell.y + realMapWidth - cell.r) / BITGRID_TILE_SIZE);
+					let ymax = ((cell.y + realMapWidth + cell.r) / BITGRID_TILE_SIZE);
+					if (~~xmin !== (xmin & 0x1f) || ~~xmax !== (xmax & 0x1f) || ~~ymin !== (ymin & 0x1f)
+						|| ~~ymax !== (ymax & 0x1f)) bitgridBoundsExceeded.add(cell);
+					xmin &= 0x1f; xmax &= 0x1f; ymin &= 0x1f; ymax &= 0x1f;
+					for (let x = 0; x < 31; ++x) {
+						for (let y = 0; y < 31; ++y) {
+							const cellShouldBeHere = xmin <= x && x <= xmax && ymin <= y && y <= ymax;
+							if (bitgridTiles[y * 32 + x].has(cell) !== cellShouldBeHere) {
+								invalidBitgridPlacement.add(cell);
+							}
+						}
+					}
+				});
+
+				for (const player of players.values()) {
+					for (const cell of player.owned) {
+						if (cell.owner !== player) unrecognizedParent.add(cell);
+					}
+				}
+
+				const bad = [];
+				if (alreadyDead.size) bad.push(`[FAIL] Dead cells: ${alreadyDead.size}`);
+				if (expiredOwner.size) bad.push(`[FAIL] Expired owner: ${expiredOwner.size}`);
+				if (forgottenBoostingCell.size) bad.push(`[FAIL] Forgotten boosting cells: ${forgottenBoostingCell.size}`);
+				if (forgottenPlayerCell.size) bad.push(`[FAIL] Forgotten player cells: ${forgottenPlayerCell.size}`);
+				if (bitgridBoundsExceeded.size) bad.push(`[FAIL] Bitgrid bounds exceeded: ${bitgridBoundsExceeded.size}`);
+				if (invalidBitgridPlacement.size) bad.push(`[FAIL] Invalid bitgrid placement: ${invalidBitgridPlacement.size}`);
+				if (unrecognizedChild.size) bad.push(`[FAIL] Unrecognized children: ${unrecognizedChild.size}`);
+				if (unrecognizedParent.size) bad.push(`[FAIL] Unrecognized parents: ${unrecognizedParent.size}`);
+				if (localPellets !== pellets) bad.push(`[FAIL] Mismatched pellet count`);
+				if (localViruses !== viruses) bad.push(`[FAIL] Mismatched virus count`);
+				if (duplicateBitgridResult.size) bad.push(`[FAIL] Duplicate bitgrid results: ${duplicateBitgridResult.size}`);
+
+				if (!bad.length) return 'No problems found\n';
+
+				try {
+					const badCells = new Set();
+					for (const collection of [alreadyDead, expiredOwner, forgottenBoostingCell, forgottenPlayerCell,
+						bitgridBoundsExceeded, invalidBitgridPlacement]) {
+						for (const cell of collection) badCells.add(cell);
+					}
+
+					const lines = [`${new Date().toISOString()} | Uncorrupt report:`];
+					for (const cell of badCells) {
+						const dupe = { ...cell };
+						dupe.type = ({
+							[CELL_TYPE_PLAYER]: 'CELL_TYPE_PLAYER',
+							[CELL_TYPE_VIRUS]: 'CELL_TYPE_VIRUS',
+							[CELL_TYPE_EJECT]: 'CELL_TYPE_EJECT',
+							[CELL_TYPE_PELLET]: 'CELL_TYPE_PELLET',
+						})[dupe.type];
+						dupe.owner = dupe.owner.id;
+						dupe.moveU8 = dupe.moveDat = dupe.moveU8.length;
+						dupe.firstU8 = dupe.firstDat = dupe.firstU8.length;
+						lines.push(' - ' + JSON.stringify(dupe));
+					}
+
+					log.write(lines.join('\n') + '\n');
+					bad.push('A report has been saved to the current log file.');
+				} catch (err) {
+					console.error(err);
+					log.write(`${new Date().toISOString()} | exception:\n - Error: ${err}\n - Stack: ${err.stack}\n`);
+					bad.push(`An error occurred while generating the report: ${String(err)}, ${err.stack}`);
+				}
+
+				/* try {
+					for (const cell of invalidBitgridPlacement) {
+						for (let i = 0; i < 32 * 32; ++i) {
+							bitgridTiles[i].delete(cell);
+						}
+						bitgridAdd(cell);
+					}
+
+					pellets = localPellets;
+					viruses = localViruses;
+
+					bad.push('The problems should have been fixed now.');
+				} catch (err) {
+					console.error(err);
+					log.write(`${new Date().toISOString()} | exception:\n - Error: ${err}\n - Stack: ${err.stack}\n`);
+					bad.push(`An error occurred while uncorrupting the game: ${String(err)}, ${err.stack}`);
+				} */
+
+				return bad.join('\n') + '\n';
 			} else {
 				return `unknown command ${cmd}\n`;
 			}
@@ -2167,7 +2369,8 @@ commandStream.question('@ ', ask);
 // | Resource Monitoring                                                                                               |
 // +-------------------------------------------------------------------------------------------------------------------+
 
-const log = fs.createWriteStream(`log-${new Date().toISOString()}.txt`);
+try { fs.mkdirSync('logs'); } catch (_) {};
+const log = fs.createWriteStream(`logs/log-${new Date().toISOString()}.txt`);
 setInterval(() => {
 	const averages = [];
 	let avgTickTime = 0;
@@ -2199,6 +2402,6 @@ setInterval(() => {
 console.log(`server started in ${performance.now().toFixed(1)}ms`);
 
 process.on('uncaughtException', (err, origin) => {
-	log.write(`${new Date().toISOString()} | uncaughtException:\nerr: ${err}\norigin: ${origin}\n`);
+	log.write(`${new Date().toISOString()} | uncaughtException:\n - Error: ${err}\n - Stack: ${err.stack}\n`);
 	console.error(err);
 });
