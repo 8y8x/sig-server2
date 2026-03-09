@@ -1,8 +1,8 @@
 # sig-server2
 A game server for agar.io-like games, specifically implementing the Sigmally.com
 protocol. It's essentially an optimized rewrite of
-[https://github.com/Luka967/OgarII](OgarII) and
-[https://github.com/8y8x/sig-server](sig-server), being about 10x faster under
+[OgarII](https://github.com/Luka967/OgarII) and
+[sig-server](https://github.com/8y8x/sig-server), being about 10x faster under
 real-world conditions, while still being written in pure JavaScript.
 
 The physics are identical to OgarII. Many quirky behaviours of OgarII are
@@ -43,7 +43,7 @@ sig-server2 relies on Node.js and uWebSockets.js.
 
 To connect to the server, you need Sigmally Fixes.
 1. If you don't have it already, install
-[https://greasyfork.org/en/scripts/483587-sigmally-fixes-v2](Sigmally Fixes)
+[Sigmally Fixes](https://greasyfork.org/en/scripts/483587-sigmally-fixes-v2)
 by following the instructions there.
 2. Open https://one.sigmally.com/?ip=ws://localhost/sigmally.com in your browser
 to play Sigmally on your private server (localhost).
