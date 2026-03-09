@@ -1,7 +1,7 @@
 {
   "name": "sig-server2",
   "version": "1.0.0",
-  "description": "a simpler sigmally/ogar server that just works",
+  "description": "An optimized agar.io-like server based on OgarII",
   "license": "MIT",
   "author": "8y8x",
   "type": "commonjs",

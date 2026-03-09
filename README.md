@@ -54,3 +54,6 @@ console.
 To change server settings, open the settings.json file in a text editor (like
 Notepad), make your changes, and save. If the server's still running, run the
 `reload` command in the console.
+
+# License
+MIT license
